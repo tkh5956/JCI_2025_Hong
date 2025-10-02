@@ -1,0 +1,357 @@
+rm(list=ls())
+
+##### Library
+library(xtable)
+library(ggplot2)
+library(dplyr)
+################################################################################
+# Purpose: Supplementary R code for the manuscript 
+#          Data loading + Generating Tables/Figures
+# Manuscript Title: 'Multivariate Zero-Inflated Causal Model for Regional  
+#                    Mobility Restriction Effects on Consumer Spending'
+# Author: Taekwon Hong, Wenbin Lu, Shu Yang, and Pulak Ghosh
+################################################################################
+
+################################################################################
+################################# Setup Stage ##################################
+################################################################################
+
+##### Fixed parameters in Simulation
+K=4; num = 1000; L = 5
+
+##### Specify the following parameters
+setwd("path/to/your/working/directory") # Set your working directory
+sim_model = "P1" # or, "P2"
+Tp = 100 # or, 200
+N1 <- N2 <- 100 # or, 300
+N = N1 + N2
+
+##### Load simulation data 
+target_data = paste0(sim_model,"_N",N,"_Iter",num,"_Tp",Tp,"_Result.RData")
+load(target_data)
+
+##### Parameters and estimates
+para = result$para 
+nui = result$nui
+nui_true_g = nui[1:3]   
+est = result$estimates_c[1:3,]
+est3 = rbind(result$estimates_wp[1,],rep(0,num),rep(0,num))
+nui_true_p = nui[4:6]
+est_c = result$estimates_c[4:6,]
+est_w = rbind(result$estimates_wp[2:3,],0)
+
+
+################################################################################
+################################# Processing ###################################
+################################################################################
+
+Processing_function = function(result) {
+  
+  ### Vectorizing
+  result$cgh_npi = matrix(unlist((result$cgh_npi)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$cgh_npi_niiw = matrix(unlist((result$cgh_npi_niiw)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$wgh_npi = matrix(unlist((result$wgh_npi)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$wgh_npi_niiw = matrix(unlist((result$wgh_npi_niiw)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  
+  result$nh_cgpi = matrix(unlist((result$nh_cgpi)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$nh_cgpi_niiw = matrix(unlist((result$nh_cgpi_niiw)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$nh_wgpi = matrix(unlist((result$nh_wgpi)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$nh_wgpi_niiw = matrix(unlist((result$nh_wgpi_niiw)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  
+  result$nh_cppi = matrix(unlist((result$nh_cppi)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$nh_cppi_niiw = matrix(unlist((result$nh_cppi_niiw)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$nh_wppi = matrix(unlist((result$nh_wppi)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  result$nh_wppi_niiw = matrix(unlist((result$nh_wppi_niiw)[!sapply(result$nothing,is.null)]),ncol=sum(!sapply(result$nothing,is.null)))
+  
+  ### Asymptotic covariance calculator
+  asym_cov = function(coef){
+    asym1=result[[paste0(coef,"_hat_cov")]]
+    
+    if (length(grep('nothing',coef))==1) {asym1 = lapply(asym1, function(x) x**2)}
+    coef1 = result[[coef]]
+    
+    asym1<-asym1[!sapply(coef1,is.null)]
+    coef1<-coef1[!sapply(coef1,is.null)]
+    num = length(coef1)
+    asym1 = matrix(unlist(asym1), ncol=num)
+    coef1 = matrix(unlist(coef1), ncol=num)
+    
+    
+    # ESE calculation
+    ese = rowMeans(sqrt(asym1))
+    margins = qnorm(0.975)*sqrt(asym1)
+    margins1 = list()
+    for (j in 1:num) {
+      margins1[[j]] = margins[,j]
+    }
+    
+    margins = c(margins1)
+    coverage = list()
+    for (i in 1:length(margins)) {
+      ubd = coef1[,i] + margins[[i]]
+      lbd = coef1[,i] - margins[[i]]
+      coverage[[i]] = (para<ubd)*(para>lbd)
+    }
+    coverage = Reduce("+",coverage)/length(coverage)
+    return(list(coef=coef1, ese=ese, coverage=coverage))
+  }
+  
+  estimates_c = (result$estimates_c)[,!sapply(result$nothing, is.null)]
+  estimates_wp = (result$estimates_wp)[,!sapply(result$nothing, is.null)]
+  
+  nothing = asym_cov("nothing")
+  nothing_niiw = asym_cov("nothing")
+  
+  cgh_cppi = asym_cov("cgh_cppi")
+  cgh_cppi_niiw = asym_cov("cgh_cppi_niiw")
+  cgh_wppi = asym_cov("cgh_wppi")
+  cgh_wppi_niiw = asym_cov("cgh_wppi_niiw")
+  wgh_cppi = asym_cov("wgh_cppi")
+  wgh_cppi_niiw = asym_cov("wgh_cppi_niiw")
+  wgh_wppi = asym_cov("wgh_wppi")
+  wgh_wppi_niiw = asym_cov("wgh_wppi_niiw")
+  
+  cgh_cgpi = asym_cov("cgh_cgpi")
+  cgh_cgpi_niiw = asym_cov("cgh_cgpi_niiw")
+  cgh_wgpi = asym_cov("cgh_wgpi")
+  cgh_wgpi_niiw = asym_cov("cgh_wgpi_niiw")
+  wgh_cgpi = asym_cov("wgh_cgpi")
+  wgh_cgpi_niiw = asym_cov("wgh_cgpi_niiw")
+  wgh_wgpi = asym_cov("wgh_wgpi")
+  wgh_wgpi_niiw = asym_cov("wgh_wgpi_niiw")
+  num = num - sum(sapply(result$nothing, is.null))
+  
+  ########################## Step 1: Table generator ###########################
+  ### Subtable generation
+  attach(result)
+  ## Case 1: Correctly specified propensity & Correct IIW
+  psi_cc_tble1 = data.frame(
+    nh_cgpi = c(round(rowMeans(nh_cgpi)-para,3)*100),
+    nh_cppi_ssd = round(apply(nh_cgpi,1,sd),3)*100,
+    cgh_npi = c(round(rowMeans(cgh_npi)-para,3)*100),
+    cgh_npi_ssd = round(apply(cgh_npi,1,sd),3)*100,
+    cgh_cgpi = c(round(rowMeans(cgh_cgpi$coef)-para,3)*100),
+    cph_cgpi_ssd = (round(apply(cgh_cgpi$coef,1,sd),3)*100),
+    cph_cgpi_ese =(round((cgh_cgpi$ese),3)*100),
+    cph_cgpi_cp = (round((cgh_cgpi$coverage),3)*100)
+  )
+  psi_cc_tble2 = data.frame(
+    nh_cgpi = c(round(rowMeans(nh_cgpi)-para,3)*100),
+    nh_cppi_ssd = round(apply(nh_cgpi,1,sd),3)*100,
+    cgh_npi = c(round(rowMeans(wgh_npi)-para,3)*100),
+    cgh_npi_ssd = round(apply(wgh_npi,1,sd),3)*100,
+    cgh_cgpi = c(round(rowMeans(wgh_cgpi$coef)-para,3)*100),
+    cph_cgpi_ssd = (round(apply(wgh_cgpi$coef,1,sd),3)*100),
+    cph_cgpi_ese =(round((wgh_cgpi$ese),3)*100),
+    cph_cgpi_cp = (round((wgh_cgpi$coverage),3)*100)
+  )
+  
+  
+  rownames(psi_cc_tble1) <-c(paste0( c(paste0("[Correct h] Cat ",1:10))))
+  rownames(psi_cc_tble2) <- c(paste0( c(paste0("[Wrong h] Cat ",1:10))))
+  colnames(psi_cc_tble1) <- colnames(psi_cc_tble2) <-  c("SING_PI_g_bias","SING_PI_g_ssd",
+                                                         "SING_h_g_bias","SING_h_g_ssd",
+                                                         "DOUB_PI_g","DOUB_PI_g_ssd","DOUB_PI_g_ese","DOUB_PI_g_cp")
+  psi_cc_tble = rbind(psi_cc_tble1, psi_cc_tble2)
+  
+  ## Case 2: Correctly specified propensity & Wrong IIW
+  psi_cw_tble1 = data.frame(
+    nh_cgpi = c(round(rowMeans(nh_cgpi_niiw)-para,3)*100),
+    nh_cppi_ssd = round(apply(nh_cgpi_niiw,1,sd),3)*100,
+    cgh_npi = c(round(rowMeans(cgh_npi_niiw)-para,3)*100),
+    cgh_npi_ssd = round(apply(cgh_npi_niiw,1,sd),3)*100,
+    cgh_cgpi = c(round(rowMeans(cgh_cgpi_niiw$coef)-para,3)*100),
+    cph_cgpi_ssd = (round(apply(cgh_cgpi_niiw$coef,1,sd),3)*100),
+    cph_cgpi_ese =(round((cgh_cgpi_niiw$ese),3)*100),
+    cph_cgpi_cp = (round((cgh_cgpi_niiw$coverage),3)*100)
+  )
+  psi_cw_tble2 = data.frame(
+    nh_cgpi = c(round(rowMeans(nh_cgpi_niiw)-para,3)*100),
+    nh_cppi_ssd = round(apply(nh_cgpi_niiw,1,sd),3)*100,
+    cgh_npi = c(round(rowMeans(wgh_npi_niiw)-para,3)*100),
+    cgh_npi_ssd = round(apply(wgh_npi_niiw,1,sd),3)*100,
+    cgh_cgpi = c(round(rowMeans(wgh_cgpi_niiw$coef)-para,3)*100),
+    cph_cgpi_ssd = (round(apply(wgh_cgpi_niiw$coef,1,sd),3)*100),
+    cph_cgpi_ese =(round((wgh_cgpi_niiw$ese),3)*100),
+    cph_cgpi_cp = (round((wgh_cgpi_niiw$coverage),3)*100)
+  )
+  
+  
+  rownames(psi_cw_tble1) <-c(paste0( c(paste0("[Correct h] Cat ",1:10))))
+  rownames(psi_cw_tble2) <- c(paste0( c(paste0("[Wrong h] Cat ",1:10))))
+  colnames(psi_cw_tble1) <- colnames(psi_cw_tble2) <-  c("SING_PI_g_bias","SING_PI_g_ssd",
+                                                         "SING_h_g_bias","SING_h_g_ssd",
+                                                         "DOUB_PI_g","DOUB_PI_g_ssd","DOUB_PI_g_ese","DOUB_PI_g_cp")
+  psi_cw_tble = rbind(psi_cw_tble1, psi_cw_tble2)
+  
+  ## Case 3: Wrongly specified propensity & Correctly IIW
+  psi_wc_tble1 = data.frame(
+    nh_cgpi = c(round(rowMeans(nh_wgpi)-para,3)*100),
+    nh_cppi_ssd = round(apply(nh_wgpi,1,sd),3)*100,
+    cgh_npi = c(round(rowMeans(cgh_npi)-para,3)*100),
+    cgh_npi_ssd = round(apply(cgh_npi,1,sd),3)*100,
+    cgh_cgpi = c(round(rowMeans(cgh_wgpi$coef)-para,3)*100),
+    cph_cgpi_ssd = (round(apply(cgh_wgpi$coef,1,sd),3)*100),
+    cph_cgpi_ese =(round((cgh_wgpi$ese),3)*100),
+    cph_cgpi_cp = (round((cgh_wgpi$coverage),3)*100)
+  )
+  psi_wc_tble2 = data.frame(
+    nh_cgpi = c(round(rowMeans(nh_wgpi)-para,3)*100),
+    nh_cppi_ssd = round(apply(nh_wgpi,1,sd),3)*100,
+    cgh_npi = c(round(rowMeans(wgh_npi)-para,3)*100),
+    cgh_npi_ssd = round(apply(wgh_npi,1,sd),3)*100,
+    cgh_cgpi = c(round(rowMeans(wgh_wgpi$coef)-para,3)*100),
+    cph_cgpi_ssd = (round(apply(wgh_wgpi$coef,1,sd),3)*100),
+    cph_cgpi_ese =(round((wgh_wgpi$ese),3)*100),
+    cph_cgpi_cp = (round((wgh_wgpi$coverage),3)*100)
+  )
+  
+  
+  rownames(psi_wc_tble1) <-c(paste0( c(paste0("[Correct h] Cat ",1:10))))
+  rownames(psi_wc_tble2) <- c(paste0( c(paste0("[Wrong h] Cat ",1:10))))
+  colnames(psi_wc_tble1) <- colnames(psi_wc_tble2) <- c("SING_PI_g_bias","SING_PI_g_ssd",
+                                                        "SING_h_g_bias","SING_h_g_ssd",
+                                                        "DOUB_PI_g","DOUB_PI_g_ssd","DOUB_PI_g_ese","DOUB_PI_g_cp")
+  psi_wc_tble = rbind(psi_wc_tble1, psi_wc_tble2)
+  
+  
+  ## Case 4: Wrongly specified propensity & Wrong IIW
+  psi_ww_tble1 = data.frame(
+    nh_cgpi = c(round(rowMeans(nh_wgpi_niiw)-para,3)*100),
+    nh_cppi_ssd = round(apply(nh_wgpi_niiw,1,sd),3)*100,
+    cgh_npi = c(round(rowMeans(cgh_npi_niiw)-para,3)*100),
+    cgh_npi_ssd = round(apply(cgh_npi_niiw,1,sd),3)*100,
+    cgh_cgpi = c(round(rowMeans(cgh_wgpi_niiw$coef)-para,3)*100),
+    cph_cgpi_ssd = (round(apply(cgh_wgpi_niiw$coef,1,sd),3)*100),
+    cph_cgpi_ese =(round((cgh_wgpi_niiw$ese),3)*100),
+    cph_cgpi_cp = (round((cgh_wgpi_niiw$coverage),3)*100)
+  )
+  psi_ww_tble2 = data.frame(
+    nh_cgpi = c(round(rowMeans(nh_wgpi_niiw)-para,3)*100),
+    nh_cppi_ssd = round(apply(nh_wgpi_niiw,1,sd),3)*100,
+    cgh_npi = c(round(rowMeans(wgh_npi_niiw)-para,3)*100),
+    cgh_npi_ssd = round(apply(wgh_npi_niiw,1,sd),3)*100,
+    cgh_cgpi = c(round(rowMeans(wgh_wgpi_niiw$coef)-para,3)*100),
+    cph_cgpi_ssd = (round(apply(wgh_wgpi_niiw$coef,1,sd),3)*100),
+    cph_cgpi_ese =(round((wgh_wgpi_niiw$ese),3)*100),
+    cph_cgpi_cp = (round((wgh_wgpi_niiw$coverage),3)*100)
+  )
+  
+  
+  rownames(psi_ww_tble1) <-c(paste0( c(paste0("[Correct h] Cat ",1:10))))
+  rownames(psi_ww_tble2) <- c(paste0( c(paste0("[Wrong h] Cat ",1:10))))
+  colnames(psi_ww_tble1) <- colnames(psi_ww_tble2) <-  c("SING_PI_g_bias","SING_PI_g_ssd",
+                                                         "SING_h_g_bias","SING_h_g_ssd",
+                                                         "DOUB_PI_g","DOUB_PI_g_ssd","DOUB_PI_g_ese","DOUB_PI_g_cp")
+  psi_ww_tble = rbind(psi_ww_tble1, psi_ww_tble2)
+  
+  ### Combined table generation
+  tble = rbind(psi_cc_tble,psi_cw_tble, psi_wc_tble, psi_ww_tble)
+  tble = cbind(
+    rep(c("Common: Ild","Common: Es",paste0(c("Category: Int","Category: Dld"),rep(1:K,each=2))), 2*K),
+    c(rep(c(rep("Correct gamma",2*10),rep("Wrong gamma",2*10)),2)),   
+    c(rep(c(rep("Correct pi",4*10),rep("Wrong pi",4*10)),1)),         
+    c(rep(c(rep("Correct h",10),rep("Wrong h",10)),4)),               
+    tble
+  )
+  
+  colnames(tble)[1:4] = c("Parameters","Intensity (gamma)","Propensity (pi)","Outcome (h)")
+  tble = cbind(tble[,c(1:4)],data.frame(Sp1=paste0(tble[,5]," (",tble[,6],")"),
+                                        Sh1=paste0(tble[,7]," (",tble[,8],")"),
+                                        DB1=paste0(tble[,9]," (",tble[,10],"/",tble[,11],"/",tble[,12],")")
+  )); tble = tble[c(3:10,1:2)+rep(seq(from=0,to=70,by=10),each=10),]
+  final_table = rbind( cbind(tble[c(1:10),3:7],    # Correct gamma, Correct pi, Correct h
+                             tble[c(21:30),5:7]),  # Wrong gamma, Correct pi, Correct h
+                       
+                       cbind(tble[c(41:50),3:7],   # Correct gamma, Wrong pi, Correct h
+                             tble[c(61:70),5:7]),  # Wrong gamma, Wrong pi, Correct h
+                       
+                       cbind(tble[c(11:20),3:7],   # Correct gamma, Correct pi, Wrong h
+                             tble[c(31:40),5:7]),  # Wrong gamma, Correct pi, Wrong h
+                       
+                       cbind(tble[c(51:60),3:7],   # Correct gamma, Wrong pi, Wrong h
+                             tble[c(71:80),5:7])   # Wrong gamma, Wrong pi, Wrong h
+  )
+
+  final_table[,1] = c(c("pi_c,h_c",rep("",9)),c("pi_w,h_c",rep("",9)),c("pi_c,h_w",rep("",9)),c("pi_w,h_w",rep("",9)))
+  final_table[,2] = rep(c("psi_10","psi_11","psi_20","psi_21","psi_30","psi_31","psi_40","psi_41","psi_(1)","psi_(2)"),4)
+  final_table = rbind(c("","","gamma_c","","","gamma_w","",""), final_table)
+  colnames(final_table) = c("Nuisance Functions","Parameters",
+                            rep(c("PSI_(pi,gamma)","PSI_(h)","PSI_(pi,gamma,h)"),2))
+  
+  ########################## Step 2: Figure generator ##########################
+  ### Dataframe generation
+  ests_df = data.frame(pi = c(rep(paste0("Correct Propensity ","\u03C0"),num*10*2*2),rep(paste0("Wrong Propensity ","\u03C0"),num*10*2*2)),
+                       iiw = rep(c(rep(paste0("Correct Intensity ","\u03B3"),num*10*2),rep(paste0("Wrong Intensity ","\u03B3"),num*10*2)),2),
+                       h = rep(c(rep("Correct Mean Outcome",num*10),rep("Wrong Mean Outcome",num*10)),2*2),
+                       group = rep(rep(c("Common: Ild","Common: Es",paste0(c("Category: Int","Category: Dld"),rep(1:K,each=2))),num),2*2*2),
+                       #group2 = rep(rep(rep(rep(c("+","-"), each=4),2),num),2*2*2),
+                       num = rep(rep(c(9,10,1:8),num),2*2*2),
+                       para = rep(rep(para,num),2*2*2),
+                       var1 = rep(c(nothing$coef, nothing_niiw$coef), 4),
+                       var2 = c(rep(c(nh_cgpi),2), rep(c(nh_cgpi_niiw),2),
+                                rep(c(nh_wgpi),2), rep(c(nh_wgpi_niiw),2)),
+                       var3 = rep(c(cgh_npi, wgh_npi, cgh_npi_niiw, wgh_npi_niiw),2),
+                       var4 = c(cgh_cgpi$coef, wgh_cgpi$coef, cgh_cgpi_niiw$coef, wgh_cgpi_niiw$coef, 
+                                cgh_wgpi$coef, wgh_wgpi$coef, cgh_wgpi_niiw$coef, wgh_wgpi_niiw$coef)
+  )
+  ests_df$pi = factor(ests_df$pi, levels=c(paste0("Correct Propensity ","\u03C0"),paste0("Wrong Propensity ","\u03C0")))
+  ests_df$iiw = factor(ests_df$iiw, levels=c(paste0("Correct Intensity ","\u03B3"),paste0("Wrong Intensity ","\u03B3")))
+  ests_df$h = factor(ests_df$h, levels=c("Correct Mean Outcome","Wrong Mean Outcome"))
+  ests_df$group = factor(ests_df$group, levels=c("Common: Ild","Common: Es",paste0(c("Category: Int","Category: Dld"),rep(1:K,each=2))))
+  ests_df$num = factor(ests_df$num, levels=c(1:10))
+  long = tidyr::gather(ests_df, estimator, estimates, var1:var4, factor_key=TRUE)
+  long = long %>% mutate(estimator=if_else(estimator=="var1","NV",
+                                           if_else(estimator=="var2",paste0("\u03A8","\u03C0",",","\u03B3"),
+                                                   if_else(estimator=="var3",paste0("\u03A8","h"),paste0("\u03A8","\u03C0",",","\u03B3",",h")))))
+  long$estimator = factor(long$estimator, levels=c("NV",paste0("\u03A8","\u03C0",",","\u03B3"),paste0("\u03A8","h"),paste0("\u03A8","\u03C0",",","\u03B3",",h")))
+  long = long %>% mutate(comb_g = paste0(as.character(estimator),as.character(group)),
+                         sep_g = paste0(as.character(estimator),as.character(num))
+  )
+  long$comb_g = factor(long$comb_g, levels=c(paste0("NV",1:4),paste0("Spi",1:4),paste0("Sh",1:4),paste0("DB",1:4)))
+  long$sep_g = factor(long$sep_g, levels=c(paste0("NV",1:10),paste0("Spi",1:10),paste0("Sh",1:10),paste0("DB",1:10)))
+  long$bias = (long$estimates-long$para)*100
+  
+  ### Figure generation
+  ## Figure 1: Simulation Figure under correctly specified h function
+  chplot = ggplot(data = long %>% filter( h=="Correct Mean Outcome", estimator!="NV"), aes(x=estimator, y=bias, color=num)) +
+    geom_boxplot() +
+    coord_cartesian(ylim = c(-70, 70)) +
+    scale_color_discrete(name = paste("\u03C8","estimates"), 
+                         labels = c(paste0("\u03C8",c(paste0(rep(c(1,2,3,4), each=2),rep(c(0,1),4)),"(1)","(2)")))) +
+    geom_hline(yintercept=0, linetype=2, alpha=0.5) +
+    ggtitle(paste0("Under correctly specified mean outcome model h")) +
+    xlab("Estimators") + ylab(paste0("100*Bias")) +
+    facet_wrap(~pi+iiw)
+  
+  ## Figure 2: Simulation Figure under correctly specified h function
+  whplot = ggplot(data = long %>% filter(h=="Wrong Mean Outcome", estimator!="NV"), aes(x=estimator, y=bias, color=num)) +
+    geom_boxplot() +
+    coord_cartesian(ylim = c(-70, 70)) +
+    scale_color_discrete(name = paste("\u03C8","estimates"), 
+                         labels = c(paste0("\u03C8",c(paste0(rep(c(1,2,3,4), each=2),rep(c(0,1),4)),"(1)","(2)")))) +
+    geom_hline(yintercept=0, linetype=2, alpha=0.5) +
+    ggtitle(paste0("Under wrongly specified mean outcome model h")) +
+    xlab("Estimators") + ylab(paste0("100*Bias")) +
+    facet_wrap(~pi+iiw)
+  detach(result)
+  
+  result_output = list(table=final_table, chplot=chplot, whplot=whplot)
+  return(result_output)
+}
+
+################################################################################
+############################### Output Example #################################
+################################################################################
+
+target_data # Recall that this is the current simulation setup
+
+##### Simulation Output Table
+Final_result = Processing_function(result)
+knitr::kable(Final_result$table, row.names = F)
+#print(xtable(Final_result$table),include.rownames=F)
+
+##### Simulation Output Figure
+dev.new()
+Final_result$chplot  # Under correctly specified h function
+Final_result$whplot  # Under wrongly specified h function
