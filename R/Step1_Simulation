@@ -1,0 +1,1835 @@
+rm(list=ls())
+
+### Seed
+set.seed(123)
+library(doParallel)
+library(foreach)
+library(survival)
+library(purrr)
+library(dplyr)
+library(MASS)
+library(mgcv)
+library(Matrix)
+library(rootSolve)
+
+################################################################################
+# Purpose: Supplementary R code for the manuscript for 
+#          Data generation + Estimation + Result saving
+# Manuscript Title: 'Multivariate Zero-Inflated Causal Model for Regional  
+#                    Mobility Restriction Effects on Consumer Spending'
+# Author: Taekwon Hong, Wenbin Lu, Shu Yang, and Pulak Ghosh
+################################################################################
+
+################################################################################
+############################ Data Generation Step ##############################
+################################################################################
+
+############################### Parameter Setup ################################ 
+
+### Simulation parameters
+### Basic assumption for the simulation in the manuscript:
+# > There are 4 different expenditure categories
+K = 4      # Number of expenditure categories (Fixed. Don't change it)
+### > There are two subcontinents, consisting of N1 and N2 participants respectively
+N1 <- N2 <- 100     # N1 = N2: Number of subjects in each subcontinent (for simulation, it should be a multiple of K(=4))
+N = N1+N2  # Total number of subjects in data
+### > For each big region, there exists 5 regions. Therefore, in total, 10 regions exist.
+### > Assuming uniform distribution of participants, we have N1/5 = N2/5 subjects in each region.  
+L <- 5    # Number of regions in each subcontinent (Fixed. Don't change it)
+num = 1000    # Number of simulation data (num = 1000 in the manuscript simulation)
+Tp = 100   # End of the research period, i.e., t = 0, 1, ..., Tp. In manuscript, it is either 100 or 200. 
+sim_model = "P1"  # Simulation parameter setup. Should be either "P1" or "P2".
+
+### Observation process parameter
+gamma = c(0.075,  # gamma[1] = Baseline intensity = 0.75 (constant)
+          0, 0,   # These are extra 0 in case anyone wants to add parameters in baseline intensity
+                  # Currently they are all 0 (consistent with the simulation setup in the manuscript)
+                   
+          # Proportional intensity parameters (see simulation setup in the manuscript)
+          0.5,    # gamma[4] = Intensity parameter for E_{short,i,t-}
+                  #                                    ==> E_{short,i,t-}: ratio of zero expenditures across the categories
+          -0.2,   # gamma[5] = Intensity parameter for A_{t}
+          #                                            ==> A_{t}: Intervention at time t
+          -0.2,   # gamma[6] = Intensity parameter for A_{t}*D_{LkDn,t}
+          #                                            ==> D_{LkDn,t}: ratio of zero expenditures across the categories
+          0, 0, 0, 0  # These are extra 0 in case anyone wants to add parameters in proportional intensity
+                      # Currently they are all 0 (consistent with the simulation setup in the manuscript)
+          )   
+
+### Expenditure parameters
+## Causal parameters of interest: Category-specific
+if (sim_model == "P1") {
+  ## (P1) in the manuscript
+  theta = matrix(c(0.5, -0.5, 0.15, -0.15), nrow=1, byrow=T)  
+  delta = c(-0.15, 0.15, -0.5, 0.5)
+  
+} else {
+  ## (P2) in the manuscript
+  theta = matrix(c(0.15, -0.1, 0.05, -0.20), nrow=1, byrow=T)  
+  delta = c(0.2, -0.25, 0.30, -0.15)
+}
+
+## Causal parameters of interest: Modifiers shared by all categories
+psi_1 <- psi_2 <- 0.35
+
+## Non-causal parameters
+# Intercepts for each category
+p_int = as.matrix(log(c(0.3,0.5,0.7,0.9))) # Intercept for probability of Y_{k} > 0 at k=1, 2, 3, 4 
+m_int = as.matrix(c(1,1,1,1)) # Intercept for nonzero expenditure Y at k=1, 2, 3, 4
+
+# Extra parameters for each category (will be canceled out by model (1))
+alpha_1 = c(-0.05, 0.05, -0.05, 0.02); # Intercept for probability of Y_{k} > 0 at k=1, 2, 3, 4 
+alpha_2 = c(-0.05, -0.05, -0.05, -0.05)*5 # Intercept for nonzero expenditure Y at k=1, 2, 3, 4
+
+# Combined category-specific parameters
+psi=cbind(as.vector(alpha_1), as.vector(alpha_2), as.vector(theta), as.vector(delta))
+
+# Parameter of association between expenditures across time
+Tilde_rho = 0.9     
+
+# Parameter of association between expenditures across categories
+Tilde_Tau22 = matrix(0, K, K)               
+Tilde_Tau22[upper.tri(Tilde_Tau22,diag=F)] = c(0.05,-0.05,0.3,
+                                             0.1,0.45,0.5) 
+Tilde_Tau22[lower.tri(Tilde_Tau22)] = t(Tilde_Tau22)[lower.tri(Tilde_Tau22)]
+diag(Tilde_Tau22)=1; Tilde_Tau22
+
+
+### Covariate generation
+## Time varying covariate (e.g., lockdown) 
+Xvar_LkDn <- rep(0, Tp)
+lockdown_start = round(Tp/2)  # Lockdown starts from this time point
+Xvar_LkDn[(lockdown_start+1):length(Xvar_LkDn)] = 1
+
+## Individual covariate (e.g., age/100)
+Xvar_ind = sample(c(18:110),N,replace=T)/100 
+
+### Intervention A_t generation 
+pi_b1 = -0.25  # Intercept
+pi_b2 = 0.75   # Parameter for lockdown
+pi_b3 = -0.5   # Parameter for previous treatment A_(t-1)
+pi_b4 = 0      # Extra parameter in case anyone wants to add a parameter in propensity model
+pi0 = c(pi_b1, pi_b2, pi_b3, pi_b4)
+
+
+############################ Intervention Generator ############################
+
+TRT_generator = function(lockdown_start) {
+  A0 = 0
+  # region 1: A_1
+  A_1s <- A_2s <- list()
+  for (j in 1:L) {
+    A = A0
+    A_1 = c()
+
+    ### Logistic model
+    for (i in 1:Tp) {
+      Xvar = lockdown_start
+      Abar = (cumsum(Xvar_LkDn)/(Tp/2))[i]
+      pi_t = exp(pi_b1 + pi_b2*ifelse(i>Xvar, 1, 0 ) + pi_b3*Abar  )/
+        (1+exp(pi_b1 + pi_b2*ifelse(i>Xvar, 1, 0 ) + pi_b3*Abar ))
+      A = ifelse(runif(1)<pi_t, 1, 0)
+      A_1 = c(A_1, A)
+      
+    }
+    
+    A_1s[[j]] = A_1
+  }
+  
+  # region 2: A_2
+  for (j in 1:L) {
+    A = A0
+    A_2 = c()
+
+    for (i in 1:Tp) {
+      
+      Xvar = lockdown_start
+      Abar = (cumsum(Xvar_LkDn)/(Tp/2))[i]
+      pi_t = exp(pi_b1 + pi_b2*ifelse(i>Xvar, 1, 0 ) + pi_b3*Abar  )/
+        (1+exp(pi_b1 + pi_b2*ifelse(i>Xvar, 1, 0 ) + pi_b3*Abar ))
+      A = ifelse(runif(1)<pi_t, 1, 0)
+      A_2 = c(A_2, A)
+    }
+    
+    A_2s[[j]] = A_2
+  }
+  return(list(A_1s,A_2s))
+}
+
+############################ Observation Generator ############################# 
+
+### Irregular observation process (depending on the past expenditure)
+lambda = function(t,i,Y, Xvar, Abar, after_lockdown) {
+  # Considering the mean of last expenditure 
+  # only to generate h_{i}(t)
+  Y_hist_zeros = as.numeric(Y[,ncol(Y)]==0)  
+
+  # Intensity depends on both Y_hist and the covariates
+  intensity = gamma[1]*exp( 
+    Xvar_LkDn[t]/8+
+      gamma[4]*mean(Y_hist_zeros)+     # mean(Y_hist_zeros) = E_{short,i,t-}
+      gamma[5]*ifelse(t!=0,Abar[t],0) + # Abar[t] = I_{LkDn,t}
+      gamma[6]*ifelse(t!=0,Abar[t],0)*after_lockdown[t]  # after_lockdown(t) = D_{LkDn,t}
+    
+  )
+  return(intensity)
+}
+
+# Wrapper function 
+lambda_wrap = function(t,i,Y,Xvar,Abar) {
+  sapply(t, function(x) lambda(x,i,Y,Xvar,Abar))
+}
+
+# Non-homogeneous poisson process to generate observation process 
+get_nhpp_realization <- function(t, lambda, i, Y, Xvar, Abar, after_lockdown){
+  # Will sample a new time point in (last visiting time, Tp)
+  t_max <- Tp
+  lambda_star <- gamma[1]*exp(1/8+gamma[4])  # Maximum possible intensity
+  
+  # Thinning Algorithm: See Daley and Vere-Jones (2003)
+  X <- numeric()
+  while(length(X)==0){
+    u <- runif(1)
+    t <- ceiling(t - log(u)/lambda_star)
+    if (t>=t_max) {
+      break
+    }
+    if(runif(1) < lambda(t=(t), i=i, Y=Y, Xvar=Xvar, Abar=Abar, after_lockdown=after_lockdown)/lambda_star) {
+      X <- c(X,t)
+    }
+  }
+  return(list(t=X))
+}
+
+############################## Outcome Generator ############################### 
+
+### > See B.2. in Appendix for detailed data generating algorithm
+outcome_generator = function(i, A_s, num_diagonal = 3){
+  A_1s = A_s[[1]]; A_2s = A_s[[2]]
+  # Generate Y for all time points
+  index = 1
+  
+  Age = Xvar_ind[i]
+  Xvar = Xvar_LkDn
+  # Intervention trajectories
+  if (i<= N1) { 
+    Abar = A_1s[[ceiling(i/(N1/L))]]
+  } else {
+    Abar = A_2s[[ceiling((i-N1)/(N2/L))]]
+  }  
+  ##### Step 0: Baseline
+  ### For nonzero outcome Y and zero-inflated probability 1-p
+  # Tilde_Tau22 = Desirable within-time correlation of outcome Y
+  # ==> Tau22 = Necessary within-time correlation for Z (Y = exp(Z))
+  
+  Tilde_Tau22_m = crossprod(t(sqrt(m_int/4)))*Tilde_Tau22
+  tau22 = diag(Tilde_Tau22_m)
+  Tau22_m = log(Tilde_Tau22_m*tcrossprod(sqrt(exp(tau22)-1))+matrix(1, K, K))
+  Tau21_m = log(Tilde_rho*Tilde_Tau22_m*tcrossprod(sqrt(exp(tau22)-1))+1)
+  
+  # Tilde_Tau22_p = Desirable within-time correlation of zero-inflated probability 1-p
+  # ==> Tau22 = Necessary within-time correlation for Z (Y = exp(Z))
+  Tilde_Tau22_p = crossprod(t(sqrt(abs(p_int)/8)))*Tilde_Tau22
+  tau22 = diag(Tilde_Tau22_p)
+  Tau22_p = log(Tilde_Tau22_p*tcrossprod(sqrt(exp(tau22)-1))+matrix(1, K, K))
+  Tau21_p = log(Tilde_rho*Tilde_Tau22_p*tcrossprod(sqrt(exp(tau22)-1))+1)
+  
+  nu_new_p = as.matrix(mvrnorm(1, mu=(p_int), Sigma=Tau22_p))
+  nu_new_m = as.matrix(mvrnorm(1, mu=(m_int), Sigma=Tau22_m))
+  nu_p = nu_new_p
+  nu_m = nu_new_m
+  p_s = as.matrix(exp(nu_new_p))
+  mu_s = as.matrix(nu_new_m)
+  u = runif(K)
+  nonzero = u < p_s  
+  init_Y = as.matrix(exp(mu_s))   # Baseline Y
+  
+  Y = init_Y  
+  init_t = NULL
+  
+  ##### Step 1: Initialize
+  # Generate the first time point
+  while (length(init_t) == 0){
+    gen_t = get_nhpp_realization(t=0, lambda=lambda, i=i, Y=Y, Xvar=Xvar, Abar=Abar, after_lockdown=cumsum(Xvar)/(Tp/2))
+    init_t = gen_t$t
+  }
+  t_s = gen_t$t  # Recording time points in this vector
+  
+  
+  # Generation of outcome and observation time
+  t = t_s[length(t_s)]
+  cl_t = ceiling(t)
+  
+  # Initial y_hist 
+  y_hist = init_Y
+
+  zeroinf_p = function(psi, Abar, Xvar, cl_t) {
+    past_A = ifelse(cl_t!=1, Abar[cl_t-1] ,0)
+    cur_ldw = Xvar[cl_t]
+    after_lockdown = (cumsum(Xvar)/(Tp/2))[cl_t]
+    yhist_zeros = mean(as.matrix(as.numeric(y_hist[,ncol(y_hist)]==0)))
+    yhist_pos = as.matrix(diag(y_hist[1:K, apply(y_hist,1,function(x) ifelse(sum(x==0)==ncol(Y),1,max(which(x>0))))]))
+    return(as.matrix((p_int + psi[,1]*( cur_ldw*yhist_zeros/(1+(after_lockdown)) )+ 
+                        Abar[cl_t]*( psi[,3]*(1+after_lockdown) ) )))
+  }
+  
+  
+  zeroinf_mu = function(psi, Abar, Xvar, cl_t) {
+    past_A = ifelse(cl_t!=1, Abar[cl_t-1] ,0)
+    cur_ldw = Xvar[cl_t]
+    after_lockdown = (cumsum(Xvar)/(Tp/2))[cl_t]
+    yhist_zeros = mean(as.matrix(as.numeric(y_hist[,ncol(y_hist)]==0)))
+    return(as.matrix(m_int + psi[,2]*( (1+(after_lockdown))/(cur_ldw*yhist_zeros+1) )+ 
+                       Abar[cl_t]*( (psi_1*cur_ldw+psi_2*yhist_zeros)+psi[,4]*(1+after_lockdown) ) ))
+  }
+  
+  ## nu: random effect of subject i across time and category
+  # Assume p_k and mu_k share the same random effect nu for simplicity
+  Sigma21 = Tau21_p
+  Sigma11 = Tau22_p
+  if (sum(abs(Sigma11))==0) {
+    Sigma_prod = Sigma11
+  } else {
+    Sigma11_inv = solve(Sigma11)
+    Sigma_prod = Sigma21%*%Sigma11_inv
+  }
+  cur_p = matrix(zeroinf_p(psi, Abar, Xvar, cl_t), ncol=1)
+  cond_mu_p = cur_p + Sigma_prod%*%((p_int)-(p_int))
+  cond_Sigma = Sigma11 
+  nu_new_p = as.matrix(mvrnorm(1, mu=(cond_mu_p), Sigma=cond_Sigma))
+  
+  Sigma21 = Tau21_m
+  Sigma11 = Tau22_m
+  Sigma11_inv = solve(Sigma11)
+  Sigma_prod = Sigma21%*%Sigma11_inv
+  prev_m = m_int+psi[,2]*Age
+  cur_m = matrix(zeroinf_mu(psi, Abar, Xvar, cl_t), ncol=1)
+  cond_mu_m = cur_m + Sigma_prod%*%(nu_new_m-prev_m)
+  cond_Sigma = Sigma11 - Sigma_prod%*%t(Sigma21)
+  nu_new_m = as.matrix(mvrnorm(1, mu=(cond_mu_m), Sigma=cond_Sigma))
+  
+  if (sum(abs(Tau22_p))==0) {
+    u = rep(0,K)
+  } else {
+    u = runif(K)
+  }
+  
+  nonzero = u < exp(nu_new_p)  
+  
+  nu_p = cbind(rep(0,K), nu_new_p)
+  nu_m = cbind(nu_m, nu_new_m)
+  m_p = cbind(rep(0,K), cur_p)
+  m_m = cbind(prev_m, cur_m)
+  
+  obs_Y_it = as.matrix(exp(nu_new_m))*nonzero
+  Y = cbind(c(Y,rep(0,2),p_s,mu_s), rbind(obs_Y_it,t,cl_t,exp(nu_new_p),nu_new_m))
+  y_hist = cbind(y_hist, obs_Y_it)
+  
+  ##### Step 2: After first t 
+  while (cl_t<Tp) { 
+    new_gen_t = get_nhpp_realization(t=cl_t,
+                                     lambda, i=i, 
+                                     Y=y_hist, Xvar=Xvar, Abar=Abar, 
+                                     after_lockdown = (cumsum(Xvar)/(Tp/2)) )
+    if (length(new_gen_t$t)==0) {break}
+    t_s = c(t_s, new_gen_t$t)
+    t = t_s[length(t_s)]
+    cl_t = ceiling(t)
+    
+    index = index + 1
+    
+    Sigma21 = Tau21_p
+    Sigma11 = Tau22_p
+    if (sum(abs(Sigma11))==0) {
+      Sigma_prod = Sigma11
+    } else {
+      Sigma11_inv = solve(Sigma11)
+      Sigma_prod = Sigma21%*%Sigma11_inv
+    }
+    target_nu_p = diag(nu_p[1:K,apply(y_hist,1,function(x) ifelse(sum(x==0)==ncol(Y),1,max(which(x>0))))])
+    corres_prev_p = diag(m_p[1:K,apply(y_hist,1,function(x) ifelse(sum(x==0)==ncol(Y),1,max(which(x>0))))])
+    prev_p = cur_p
+    cur_p = matrix(zeroinf_p(psi, Abar, Xvar, cl_t), ncol=1)
+    cond_mu_p = cur_p + Sigma_prod%*%(target_nu_p-corres_prev_p)
+    cond_Sigma = Sigma11 - Sigma_prod%*%t(Sigma21)
+    nu_new_p = as.matrix(mvrnorm(1, mu=(cond_mu_p), Sigma=cond_Sigma))
+    
+    Sigma21 = Tau21_m
+    Sigma11 = Tau22_m
+    Sigma11_inv = solve(Sigma11)
+    Sigma_prod = Sigma21%*%Sigma11_inv
+    target_nu_m = diag(nu_m[1:K,apply(y_hist,1,function(x) ifelse(sum(x==0)==ncol(Y),1,max(which(x>0))))])
+    corres_prev_m = diag(m_m[1:K,apply(y_hist,1,function(x) ifelse(sum(x==0)==ncol(Y),1,max(which(x>0))))])
+    cur_m = matrix(zeroinf_mu(psi, Abar, Xvar, cl_t), ncol=1)
+    cond_mu_m = cur_m + Sigma_prod%*%(target_nu_m-corres_prev_m)
+    cond_Sigma = Sigma11 - Sigma_prod%*%t(Sigma21)
+    nu_new_m = as.matrix(mvrnorm(1, mu=(cond_mu_m), Sigma=cond_Sigma))
+    
+    nu_p = cbind(nu_p, nu_new_p)
+    nu_m = cbind(nu_m, nu_new_m)
+    m_p = cbind(m_p, cur_p)
+    m_m = cbind(m_m, cur_m)
+    t = t_s[length(t_s)]
+    
+    
+    if (sum(abs(Tau22_p))==0) {
+      u = rep(0,K)
+    } else {
+      u = runif(K)
+    }
+    nonzero = u < exp(nu_new_p)  
+    obs_Y_it = as.matrix(exp(nu_new_m))*nonzero
+    if (as.numeric(Y[6,ncol(Y)]) == cl_t) {}
+    Y = as.matrix(cbind(Y,rbind(obs_Y_it,t,cl_t,exp(nu_new_p),(nu_new_m))),ncol=1)
+    y_hist = cbind(y_hist, obs_Y_it)
+    # generate next visiting time with updated Y
+  }
+  
+  Y = Y[,-1]     # Delete the first column which contains baseline Y
+  
+  # For some setting of intensity function, we failed to sample Y
+  # because generated t > Tp. We need to prevent this case.
+  if (length(Y)==(3*K+2)) {Y=as.matrix(Y, ncol=1)} 
+  rownames(Y)=c(paste0("Category ",1:K),"Real t","Ceiling t",
+                paste0("p(Category ",1:K,")"),
+                paste0("mu(Category ",1:K,")"))
+  
+  
+  return(list(Y=Y, init_Y=init_Y))
+}
+
+simulator = function(iter) {
+  A_s = TRT_generator(lockdown_start)
+  result1 = lapply(1:N, function(x) 
+    outcome_generator(x, A_s))
+  result1$A_s = A_s
+  return(result1)
+}
+
+########################## Simulation Data Generator ########################### 
+sim_data = replicate(num, simulator(), simplify = FALSE)
+
+
+################################################################################
+############################## Estimation Step #################################
+################################################################################
+
+##### Step 1: Generate dataframe with suitable format for our main analysis with 4 categories
+dframe_gen = function(simu_data, category_num, gammas){
+  A_1s = simu_data$A_s[[1]]; A_2s = simu_data$A_s[[2]]
+  simu_data = simu_data[names(simu_data)!="A_s"]
+  
+  # Removing 0 observation case
+  dat = lapply(simu_data, function(x) x$Y)
+  init_y = lapply(simu_data, function(x) x$init_Y)
+  idx = (unlist(dat %>% map(~sum(.x[(K+1),1])))==0)
+  skip_idx = which(idx==T)
+  include_idx = which(idx==F)
+  rmNullobs_dat = function(x) {
+    lapply(1:N, function(x) if (x %in% skip_idx) 
+      dat[[x]]=NULL else dat[[x]]=dat[[x]])
+  }
+  rmNullobs_init_y= function(x) {
+    lapply(1:N, function(x) if (x %in% skip_idx) 
+      init_y[[x]]=NULL else init_y[[x]]=init_y[[x]])
+  }
+  dat = rmNullobs_dat(dat)
+  dat = dat[sapply(dat, negate(anyNA))]
+  init_y = rmNullobs_init_y(init_y)
+  init_y = init_y[sapply(init_y, negate(anyNA))]
+  
+  # Observed time for each individual & entire poulation
+  obs_t = dat %>% map(~.x[(K+2),])
+  whole_t = c(1:Tp)   
+  
+  # Observed outcomes and summation of them(for iiw)
+  yti = dat %>% map(~.x[(1:K),])
+  yti_full = sapply(1:length(yti), function(x)   matrix(c(init_y[[x]],yti[[x]]),nrow=K))
+  yti = lapply(yti, function(x) if (!is.null(x)) as.matrix(x))
+  yti_full = lapply(yti_full, function(x) if (!is.null(x)) as.matrix(x))
+  y_sum_zeros_1 = lapply(yti, function(x) if (!is.null(x)) 
+    as.numeric(x[1,]==0))
+  y_sum_zeros_2 = lapply(yti, function(x) if (!is.null(x)) 
+    as.numeric(x[2,]==0))
+  y_sum_zeros_3 = lapply(yti, function(x) if (!is.null(x)) 
+    as.numeric(x[3,]==0))
+  y_sum_zeros_4 = lapply(yti, function(x) if (!is.null(x)) 
+    as.numeric(x[4,]==0))
+  y_sum_pos_1 = lapply(yti_full, function(x) if (!is.null(x)) 
+    sapply(seq(ncol(x)), function(i) ifelse(sum(x[1,1:i]==0)==i,0,x[1,max(which(x[1,1:i]>0))])  )[-1])
+  y_sum_pos_2 = lapply(yti_full, function(x) if (!is.null(x)) 
+    sapply(seq(ncol(x)), function(i) ifelse(sum(x[2,1:i]==0)==i,0,x[2,max(which(x[2,1:i]>0))])  )[-1])
+  y_sum_pos_3 = lapply(yti_full, function(x) if (!is.null(x)) 
+    sapply(seq(ncol(x)), function(i) ifelse(sum(x[3,1:i]==0)==i,0,x[3,max(which(x[3,1:i]>0))])  )[-1])
+  y_sum_pos_4 = lapply(yti_full, function(x) if (!is.null(x)) 
+    sapply(seq(ncol(x)), function(i) ifelse(sum(x[4,1:i]==0)==i,0,x[4,max(which(x[4,1:i]>0))])  )[-1])
+  
+  # Outcome history function for each individual
+  # Note: we use a summation of the very previous outcome over K categories
+  y_hist_fn = function(i) {
+    # Observed time for individual i
+    obs_t_i = obs_t[[i]]
+    
+    # Figure out the index of observed time of individual i 
+    # Among the entire observation times
+    suppressWarnings({change_pt = 
+      apply(X = outer(whole_t, obs_t_i, '>'), 
+            MARGIN = 2, FUN = function(x) min(which(x)))})
+    if (obs_t_i[length(obs_t_i)]==whole_t[length(whole_t)]) {
+      # If this individual is observed at the last observation time
+      change_pt[change_pt==Inf]=length(whole_t)+1
+    } else {
+      # If not
+      change_pt[change_pt==Inf]=length(whole_t)
+    }
+    
+    # Individual i: whether observation occurs or not is changing
+    change_pt = c(1,change_pt,length(whole_t)+1)
+    change_rep = diff(change_pt)
+    
+    # Individual i: observed time index
+    obs_i_time = c(1:length(y_sum_zeros_1[[i]]))
+    obs_index = c()
+    for (j in 1:(length(obs_i_time))) {
+      obs_index = c(obs_index, rep(0,(change_rep-1)[j]), obs_i_time[j])
+    }
+    if (obs_t_i[length(obs_t_i)]==whole_t[length(whole_t)]) {
+      # If this individual is observed at the last visiting time point
+      obs_index = c(obs_index,0)
+    } else {
+      # If not
+      obs_index = c(obs_index, rep(0, (change_rep-1)[j+1]),0,0)
+    }
+    
+    # History (recall that we only use (1) for our simulation)
+    y_hist_pos_1 = c(rep(c(sum(init_y[[i]][1,]),y_sum_pos_1[[i]]), 
+                         change_rep),y_sum_pos_1[[i]][length(y_sum_pos_1[[i]])])
+    y_hist_pos_2 = c(rep(c(sum(init_y[[i]][2,]),y_sum_pos_2[[i]]), 
+                         change_rep),y_sum_pos_2[[i]][length(y_sum_pos_2[[i]])])
+    y_hist_pos_3 = c(rep(c(sum(init_y[[i]][3,]),y_sum_pos_3[[i]]), 
+                         change_rep),y_sum_pos_3[[i]][length(y_sum_pos_3[[i]])])
+    y_hist_pos_4 = c(rep(c(sum(init_y[[i]][4,]),y_sum_pos_4[[i]]), 
+                         change_rep),y_sum_pos_4[[i]][length(y_sum_pos_4[[i]])])
+    y_hist_zeros_1 = c(rep(c(sum(init_y[[i]][1,]==0),y_sum_zeros_1[[i]]), 
+                           change_rep),y_sum_zeros_1[[i]][length(y_sum_zeros_1[[i]])])
+    y_hist_zeros_2 = c(rep(c(sum(init_y[[i]][2,]==0),y_sum_zeros_2[[i]]), 
+                           change_rep),y_sum_zeros_2[[i]][length(y_sum_zeros_2[[i]])])
+    y_hist_zeros_3 = c(rep(c(sum(init_y[[i]][3,]==0),y_sum_zeros_3[[i]]), 
+                           change_rep),y_sum_zeros_3[[i]][length(y_sum_zeros_3[[i]])])
+    y_hist_zeros_4 = c(rep(c(sum(init_y[[i]][4,]==0),y_sum_zeros_4[[i]]), 
+                           change_rep),y_sum_zeros_4[[i]][length(y_sum_zeros_4[[i]])])
+    
+    # (2) Previous outcome y
+    prev_y =c(unlist(sapply(1:length(change_rep), function(x) {
+      if (x==1) {prevy = rep(c(init_y[[i]]),change_rep[x])} else 
+      {prevy = rep(c(yti[[i]][,(x-1)]), change_rep[x])}
+      return(as.vector(prevy))
+    })),as.vector(yti[[i]][,ncol(yti[[i]])]))
+    
+    # (2-1) Previous outcome before previous y
+    pprev_y =c(unlist(sapply(1:length(change_rep), function(x) {
+      if (x<=2) {prevy = rep(c(init_y[[i]]),change_rep[x])} else 
+      {prevy = rep(c(yti[[i]][,(x-2)]), change_rep[x])}
+      return(as.vector(prevy))
+    })),as.vector(yti[[i]][,ncol(yti[[i]])]))
+    
+    # (3) 1st after_lockdown time (individual)
+    obst = c(rep(c(0,obs_t_i), change_rep),obs_t_i[length(obs_t_i)])
+    obst = as.vector(as.vector(c(whole_t,Tp)) - obst)
+    
+    # (3-1) 2nd after_lockdown time (individual)
+    obst2 = (obst)
+    
+    # (4) Weighted mean past outcome y
+    entire_t = as.vector(c(whole_t,Tp))
+    change_pt = unique(change_pt)
+    w_mean_y = c()
+    for (j in (1:length(change_rep))) {
+      comp_t = c(0,obs_t_i)[1:j]
+      if (change_pt[j]!=length(obst)) {
+        jth_target_t = entire_t[(change_pt[j]):(change_pt[j+1]-1)]
+      } else {
+        jth_target_t = entire_t[(change_pt[j])]
+      }
+      coef = 1/sapply(comp_t, function(x) jth_target_t - x)
+      coef = matrix(coef, ncol=length(comp_t))
+      rscoef = rowSums(coef)
+      numerator = coef %*% 
+        matrix(prev_y, ncol=4, byrow=T)[(change_pt[1:j]),]
+      w_mean_y = c(w_mean_y,
+                   as.vector(sapply(1:nrow(numerator), 
+                                    function(x) numerator[x,]/rscoef[x])))
+      if ((j == length(change_rep)) & 
+          (change_rep[length(change_rep)]!=0)) {
+        w_mean_y=c(w_mean_y, 
+                   w_mean_y[((length(w_mean_y)-(K-1)):length(w_mean_y))]) 
+      } 
+    }
+    
+    return(list(y_hist_pos_1, y_hist_pos_2,y_hist_pos_3, y_hist_pos_4, obs_index, prev_y, 
+                obst, w_mean_y, pprev_y, obst2, y_hist_zeros_1, y_hist_zeros_2, y_hist_zeros_3, y_hist_zeros_4))
+  }
+  
+  # The result of y_hist_fn
+  y_hist_obs = lapply(1:N, function(x) if 
+                      (x %in% include_idx) y_hist_fn(x))
+  y_hist_pos_1 = lapply(y_hist_obs, function(x) x[[1]])
+  y_hist_pos_2 = lapply(y_hist_obs, function(x) x[[2]])
+  y_hist_pos_3 = lapply(y_hist_obs, function(x) x[[3]])
+  y_hist_pos_4 = lapply(y_hist_obs, function(x) x[[4]])
+  y_index = lapply(y_hist_obs, function(x) x[[5]])
+  y_prev = lapply(y_hist_obs, function(x) x[[6]])
+  t_after_lockdown = lapply(y_hist_obs, function(x) x[[7]])
+  w_mean_y = lapply(y_hist_obs, function(x) x[[8]])
+  y_pprev = lapply(y_hist_obs, function(x) x[[9]])
+  t_after_lockdown2 = lapply(y_hist_obs, function(x) x[[10]])
+  y_hist_zeros_1 = lapply(y_hist_obs, function(x) x[[11]])
+  y_hist_zeros_2 = lapply(y_hist_obs, function(x) x[[12]])
+  y_hist_zeros_3 = lapply(y_hist_obs, function(x) x[[13]])
+  y_hist_zeros_4 = lapply(y_hist_obs, function(x) x[[14]])
+  
+  # Extra function (not necessary in our simulation)
+  intervals = matrix(c(0,rep(whole_t,each=2),Tp),ncol=2,byrow = T)
+  tstart_stop_endpt_extract = function(index){
+    endpt = rep(0,length(whole_t)+1)
+    endpt[intervals[,2]%in%obs_t[[index]]]=1
+    mat = cbind(intervals, endpt)
+    return(mat)
+  }    
+  mylist = lapply(seq_along(obs_t), function(x) 
+    if(x %in% include_idx) tstart_stop_endpt_extract(x))
+  
+  # Constructing data frame based on the preparation above
+  frame_add = function(sublist,index) {
+    sublist = sublist[-(Tp+1),]
+    # Index will be id of each subject(assume i)
+    id = index
+    
+    # Find out the information about individual i
+    if(category_num==K) {category=seq(1:K)} else if (category_num==1) {category=1}
+    
+    Age = Xvar_ind[id]
+    X = Xvar_LkDn
+    if (id<= N1) { 
+      A = A_1s[[ceiling(id/(N1/L))]]; 
+    } else {
+      A = A_2s[[ceiling((id-N1)/(N2/L))]];
+    }  
+    
+    if(id<=N1) {
+      lag_A=c(0,A)[-(Tp+1)]; lag_X=c(0,X)[-(Tp+1)]
+    } else {
+      lag_A=c(0,A)[-(Tp+1)]; lag_X=c(0,X)[-(Tp+1)]
+    }
+    after_lockdown = cumsum(X)/(Tp/2)
+    
+    yhist_pos_1 = y_hist_pos_1[[id]][-(Tp+1)]
+    yhist_pos_2 = y_hist_pos_2[[id]][-(Tp+1)]
+    yhist_pos_3 = y_hist_pos_3[[id]][-(Tp+1)]
+    yhist_pos_4 = y_hist_pos_4[[id]][-(Tp+1)]
+    yhist_zeros_1 = y_hist_zeros_1[[id]][-(Tp+1)]
+    yhist_zeros_2 = y_hist_zeros_2[[id]][-(Tp+1)]
+    yhist_zeros_3 = y_hist_zeros_3[[id]][-(Tp+1)]
+    yhist_zeros_4 = y_hist_zeros_4[[id]][-(Tp+1)]
+    
+    
+    y_idx = y_index[[id]][-(Tp+1)]
+    if (category_num==K) {
+      yprev = y_prev[[id]][seq(1,K*Tp)]
+      wmean_y = w_mean_y[[id]][seq(1,K*Tp)]
+      ypprev = y_pprev[[id]][seq(1,K*Tp)]
+    } else {yprev <- wmean_y <- ypprev <- rep(0,Tp)}
+    
+    if (category_num==K) {
+      y = as.vector(sapply(y_idx, function(x) { 
+        if (x==0) {   # Give NA for missing outcomes
+          return(rep(NA,4))
+        } else {      
+          return(yti[[id]][,x])}
+      }
+      ))
+    }
+    
+    
+    # dff: dataframe we want eventually
+    dff = data.frame(id=id, category=category, Age = Age,
+                     yprev = yprev, 
+                     X=rep(X,each=category_num),
+                     lag_X=rep(lag_X,each=category_num),
+                     A=rep(A,each=category_num), 
+                     lag_A=rep(lag_A,each=category_num), 
+                     after_lockdown=rep(after_lockdown, each=category_num),
+                     yhist_pos_1=rep(yhist_pos_1,each=category_num), 
+                     yhist_pos_2=rep(yhist_pos_2,each=category_num), 
+                     yhist_pos_3=rep(yhist_pos_3,each=category_num), 
+                     yhist_pos_4=rep(yhist_pos_4,each=category_num), 
+                     yhist_zeros_1=rep(yhist_zeros_1,each=category_num), 
+                     yhist_zeros_2=rep(yhist_zeros_2,each=category_num), 
+                     yhist_zeros_3=rep(yhist_zeros_3,each=category_num), 
+                     yhist_zeros_4=rep(yhist_zeros_4,each=category_num), 
+                     yhist_mean = rep(yhist_zeros_1+yhist_zeros_2+yhist_zeros_3+yhist_zeros_4,each=category_num)/K,
+                     obs_t=rep(sublist[,2],each=category_num),
+                     tstart = rep(sublist[,1],each=category_num), 
+                     tstop= rep(sublist[,2],each=category_num), 
+                     endpt= rep(sublist[,3],each=category_num))
+    
+    
+    # Create indicators for each variable
+    # Id
+    dff$id <- factor(dff$id)
+    
+    # Inverse intensity weight 
+    if (category_num == K) {
+      dff$y = y # outcome
+      dff$prev_y = yprev
+      dff$after_lockdown = rep(after_lockdown,each=category_num)
+      
+      dff$ind_iw =(exp(gammas[1]**dff$yhist_mean+
+                         gammas[2]*dff$A+
+                         gammas[3]*dff$A*dff$after_lockdown))
+      dff$ind_iww =(exp(gamma[4]*dff$yhist_mean+gamma[5]*dff$A))
+      
+      
+      # Intensity weight (not inverse)
+      dff$ind_iiw = 1/dff$ind_iw; dff$ind_iiww = 1/dff$ind_iww
+      
+      if ( K==4) {
+        dff = dff %>% group_by(id, obs_t) %>% 
+          dplyr::select(id, category, Age, X, lag_X, 
+                        yhist_pos_1, yhist_pos_2, yhist_pos_3, yhist_pos_4,
+                        yhist_zeros_1,yhist_zeros_2,yhist_zeros_3,yhist_zeros_4,yhist_mean,
+                        A, lag_A, obs_t, 
+                        tstart, tstop, endpt, y, 
+                        prev_y, 
+                        after_lockdown, ind_iw, ind_iww, ind_iiw, ind_iiww ) %>% 
+          ungroup()
+      }
+      
+      # Category
+      dff$category1 <- 0
+      dff$category1[dff$category==1] <- 1
+      dff$category2 <- 0
+      dff$category2[dff$category==2] <- 1
+      dff$category3 <- 0
+      dff$category3[dff$category==3] <- 1
+      dff$category4 <- 0
+      dff$category4[dff$category==4] <- 1
+      
+      # Time invariant covariate
+      dff$X1 <- 0
+      dff$X1[dff$category==1] <- dff$X[dff$category==1]
+      dff$X2 <- 0
+      dff$X2[dff$category==2] <- dff$X[dff$category==2]
+      dff$X3 <- 0
+      dff$X3[dff$category==3] <- dff$X[dff$category==3]
+      dff$X4 <- 0
+      dff$X4[dff$category==4] <- dff$X[dff$category==4]
+      
+      # Time invariant covariate
+      dff$Age1 <- 0
+      dff$Age1[dff$category==1] <- dff$Age[dff$category==1]
+      dff$Age2 <- 0
+      dff$Age2[dff$category==2] <- dff$Age[dff$category==2]
+      dff$Age3 <- 0
+      dff$Age3[dff$category==3] <- dff$Age[dff$category==3]
+      dff$Age4 <- 0
+      dff$Age4[dff$category==4] <- dff$Age[dff$category==4]
+      
+      
+      dff$lag_X1 <- 0
+      dff$lag_X1[dff$category==1] <- dff$lag_X[dff$category==1]
+      dff$lag_X2 <- 0
+      dff$lag_X2[dff$category==2] <- dff$lag_X[dff$category==2]
+      dff$lag_X3 <- 0
+      dff$lag_X3[dff$category==3] <- dff$lag_X[dff$category==3]
+      dff$lag_X4 <- 0
+      dff$lag_X4[dff$category==4] <- dff$lag_X[dff$category==4]
+      
+      # Treatment
+      dff$A1 <- 0
+      dff$A1[dff$category==1] <- dff$A[dff$category==1]
+      dff$A2 <- 0
+      dff$A2[dff$category==2] <- dff$A[dff$category==2]
+      dff$A3 <- 0
+      dff$A3[dff$category==3] <- dff$A[dff$category==3]
+      dff$A4 <- 0
+      dff$A4[dff$category==4] <- dff$A[dff$category==4]
+      
+      dff$lag_A1 <- 0
+      dff$lag_A1[dff$category==1] <- dff$lag_A[dff$category==1]
+      dff$lag_A2 <- 0
+      dff$lag_A2[dff$category==2] <- dff$lag_A[dff$category==2]
+      dff$lag_A3 <- 0
+      dff$lag_A3[dff$category==3] <- dff$lag_A[dff$category==3]
+      dff$lag_A4 <- 0
+      dff$lag_A4[dff$category==4] <- dff$lag_A[dff$category==4]
+      
+      dff$after_lockdown1 <- 0
+      dff$after_lockdown1[dff$category==1] <- dff$after_lockdown[dff$category==1]
+      dff$after_lockdown2 <- 0
+      dff$after_lockdown2[dff$category==2] <- dff$after_lockdown[dff$category==2]
+      dff$after_lockdown3 <- 0
+      dff$after_lockdown3[dff$category==3] <- dff$after_lockdown[dff$category==3]
+      dff$after_lockdown4 <- 0
+      dff$after_lockdown4[dff$category==4] <- dff$after_lockdown[dff$category==4]
+      
+      
+      pxs = dff %>% filter(category==1, endpt==1) %>% group_by(obs_t) %>% 
+        mutate(prev_x = (Age+X+lag_A+(X*(Age+lag_A))))%>%ungroup() %>% dplyr::select(prev_x)
+      pxs = c(Age,pxs$prev_x)
+      obs_t_i = obs_t[[id]]
+      
+      suppressWarnings({change_pt = 
+        apply(X = outer(whole_t, obs_t_i, '>'), 
+              MARGIN = 2, FUN = function(x) min(which(x)))})
+      if (obs_t_i[length(obs_t_i)]==whole_t[length(whole_t)]) {
+        # If this individual is observed at the last observation time
+        change_pt[change_pt==Inf]=length(whole_t)+1
+      } else {
+        # If not
+        change_pt[change_pt==Inf]=length(whole_t)
+      }
+      
+      # Individual i: whether observation occurs or not is changing
+      change_pt = c(1,change_pt,length(whole_t)+1)
+      change_rep = diff(change_pt)
+      
+      # Individual i: observed time index
+      obs_i_time = c(1:length(obs_t_i))
+      obs_index = c()
+      for (j in 1:(length(obs_i_time))) {
+        obs_index = c(obs_index, rep(0,(change_rep-1)[j]), obs_i_time[j])
+      }
+      if (obs_t_i[length(obs_t_i)]==whole_t[length(whole_t)]) {
+        # If this individual is observed at the last visiting time point
+        obs_index = c(obs_index,0)
+      } else {
+        # If not
+        obs_index = c(obs_index, rep(0, (change_rep-1)[j+1]),0,0)
+      }
+      
+      px = c()
+      for ( j in 1:length(pxs)) {
+        px = c(px,rep(pxs[j],change_rep[j]))
+      }
+      dff$prev_x = rep(px,each=K)
+    }
+    
+    return(dff)
+  }
+  
+  # Get dataframe for every subjects with at least one observation
+  dff = lapply(seq_along(mylist), function(x) if(x %in% include_idx)  
+    frame_add(mylist[[x]],x))  %>% bind_rows()
+  
+  # Suppresing messages of dplyr
+  options(dplyr.summarise.inform = FALSE)
+  
+  # It will be used as a new IIW for our proposed estimator
+  if (category_num==K) {
+    Nnow = length(levels(dff$id))
+    dff$total_iiw = rep(1/(dff %>% group_by(obs_t, category) 
+                           %>% summarise(sum=sum(ind_iw)))$sum,Nnow)
+    dff$bse = rep((dff %>% group_by(obs_t, category) 
+                   %>% summarise(sum=sum(endpt)/sum(ind_iw)))$sum,Nnow)
+    dff$bse_w = rep((dff %>% group_by(obs_t, category) 
+                     %>% summarise(sum=sum(endpt)/sum(ind_iww)))$sum,Nnow)
+  } 
+  
+  return(dff)
+}
+
+##### Step 1': Generate a dataframe with suitable format for nuisance functions (intensity and propensity)
+#####          (i.e., with 1 category only. Full data with 4 categories is not needed)
+df_gen_nui = function(simu_data) {
+  s = dframe_gen(simu_data,category_num = 1,gammas=0) 
+  return(s)
+}
+df_nuis = lapply(sim_data, df_gen_nui)
+
+##### Step 2: Nuisance function estimation
+estimation_fn = function(dat){
+  ### Observation intensity model
+  ss_w = coxph(Surv(tstart,tstop,endpt)~yhist_mean+A+cluster(id),data=dat,  # Wrong cox model
+               control = coxph.control(timefix = F))
+  ss = coxph(Surv(tstart,tstop,endpt)~yhist_mean+A*after_lockdown+cluster(id),data=dat, # Correct cox model
+             control = coxph.control(timefix = F))
+  
+  ss2 = glm(A ~ X + after_lockdown , data=dat, family = 'binomial')  # Correct "parametric" propensity model
+  ss2_w = glm(A ~ 1 , data=dat, family = 'binomial')   # Wrong "parametric" propensity model
+  
+  random_ids = seq(from=1, by=N/L/10, length.out=2*L*5)
+  dat = dat %>% filter(id %in%  random_ids)
+  dat$id = as.numeric(dat$id)
+  dat = dat %>% mutate(prop_trj = if_else(id<N/L/2, 1, # Recall that there exists 10 regions
+                                          if_else(id<N/L/2*2, 2, 
+                                                  if_else(id<N/L/2*3, 3,
+                                                          if_else(id<N/L/2*4, 4,
+                                                                  if_else(id<N/L/2*5, 5,
+                                                                          if_else(id<N/L/2*6, 6,
+                                                                                  if_else(id<N/L/2*7, 7, 
+                                                                                          if_else(id<N/L/2*8, 8,
+                                                                                                  if_else(id<N/L/2*9, 9, 10))))))))))
+  
+  target_ids = (dat %>% group_by(prop_trj) %>% summarize(id = min(id)))$id
+  dat = dat %>% filter(id %in% target_ids)
+  
+  prop_gam_c= function(dat) {    # Correct "nonparametric" propensity model
+    varnames = c("X","after_lockdown","A")
+    df = dat[,match(varnames,names(dat))]
+    return(gam(A ~ s(X,after_lockdown), data=df, family=binomial())) # Correctly specified propensity
+  }
+  ss_prop = prop_gam_c(dat)
+  dat$muhat = predict(ss_prop, dat, type="response")  # Correct prediction of propensity
+  
+  prop_gam_w = function(dat) {  # Wrong "nonparametric" propensity model
+    varnames = c("X","after_lockdown","A")
+    df = dat[,match(varnames,names(dat))]
+    return(gam(A ~ 1, data=df, family=binomial())) # Wrongly specified propensity model
+  }
+  ss_prop = prop_gam_w(dat)
+  dat$muhat_w = predict(ss_prop, dat, type="response")  # Wrong prediction of propensity
+  
+  trj = dat %>% dplyr::select(id, prop_trj, muhat, muhat_w)
+  res = list(coef=c(ss$coefficients[-3], ss_w$coefficients, ss2$coefficients, ss2_w$coefficients),trj=trj)
+  
+  
+  return(res)
+}
+
+cond_c = (lapply(df_nuis, function(x) estimation_fn(x)))
+estimates = sapply(cond_c,"[[",1)
+estimates_c = estimates[c(1:3,6:8),]   # Estimates from the correctly specified models
+estimates_wp = estimates[c(4:5,9),]    # Estimates from the wrongly specified models
+prop_trjs = sapply(cond_c,"[[",2)      # Predicted propensity
+
+# Save results upto this moment (intermediate step, not required)
+result = list(sim_data = sim_data, estimates_c = estimates_c, estimates_wp = estimates_wp,  
+              prop_trjs = prop_trjs)
+
+##### Step 3: Mean outcome model estimation
+psi_estimation= function(iter){       # Iteration idx. iter = 1, 2, ..., num (=total number of simulation iteration)
+  ### Target simulated data
+  simu_data = sim_data[[iter]]
+  A_1s = simu_data$A_s[[1]]; A_2s = simu_data$A_s[[2]]
+  simu_data = simu_data[names(simu_data)!="A_s"]
+  
+  ### Removing 0 observation case
+  dat = lapply(simu_data, function(x) x$Y)
+  init_y = lapply(simu_data, function(x) x$init_Y)
+  idx = (unlist(dat %>% map(~sum(.x[(K+1),1])))==0)
+  skip_idx = which(idx==T)
+  include_idx = which(idx==F)
+  
+  ### Target simulated data
+  simu_data = sim_data[[iter]]
+  
+  ### Plug in nuisance function parameters
+  gammas=c(estimates_c[1:3,iter],estimates_wp[1:2,iter])  # Estimates of intensity parameter gamma
+  pis = estimates_c[4:6,iter]; pis_w = estimates_wp[3,iter] # Estimates of propensity parameters (in parametric model)
+
+  df_full = dframe_gen(simu_data, category_num = K, gammas=gammas)
+  
+  ### Plug in predicted propensity score based on 'nonparametric' model
+  df_full$pihat_gam <- df_full$pihat_wgam <- 0
+  p_trj = matrix(prop_trjs[,iter]$muhat,ncol=2*L, byrow=F)
+  p_trj_w = matrix(prop_trjs[,iter]$muhat_w,ncol=2*L, byrow=F)
+  
+  for (j in 1:(2*L)) {
+    df_full$pihat_gam[as.numeric(df_full$id) %in% seq(from=(N/L/2*(j-1))+1,to =N/L/2*j)] = rep(p_trj[,j],each=K)
+    df_full$pihat_wgam[as.numeric(df_full$id) %in% seq(from=(N/L/2*(j-1))+1,to =N/L/2*j)] = rep(p_trj_w[,j],each=K)
+  }
+  
+  df_full = df_full %>% mutate(lambdat = bse, lambdat_w = bse_w)
+  
+  ### Plug in predicted propensity score based on 'parametric' model
+  ##  > Predicted propensity from the correctly specified 'parametric' propensity model
+  df_full = df_full %>% mutate(pihat_cs = exp(pis[1]+pis[2]*X+pis[3]*after_lockdown)/
+                                 (1+exp(pis[1]+pis[2]*X+pis[3]*after_lockdown)))
+  
+  ##  > Predicted propensity from the wrongly specified 'parametric' propensity model
+  df_full = df_full %>% mutate(pihat_wcs = exp(pis_w[1])/(1+exp(pis_w[1])))
+  df_full = df_full %>% mutate(iafter_lockdown = if_else(after_lockdown>1/gamma[1], 1, 0 ))
+  
+  
+  df_full$x1 = (df_full$X1+df_full$lag_A1)*(1+df_full$after_lockdown)
+  df_full$x2 = (df_full$X2+df_full$lag_A2)*(1+df_full$after_lockdown)
+  df_full$x3 = (df_full$X3+df_full$lag_A3)*(1+df_full$after_lockdown)
+  df_full$x4 = (df_full$X4+df_full$lag_A4)*(1+df_full$after_lockdown)
+  df_full = df_full %>% group_by(id, obs_t) %>% mutate(x = sum(x1, x2, x3, x4)) %>% ungroup()
+  df_full$Ax1 = df_full$A*df_full$x1
+  df_full$Ax2 = df_full$A*df_full$x2
+  df_full$Ax3 = df_full$A*df_full$x3
+  df_full$Ax4 = df_full$A*df_full$x4
+  
+  
+  ### 'Nonparametric' mean outcome model h(\overline{L}_{i,t})=E(Y_{i,k,t}|\overline{L}_{i,t},A_{t}=0) estimation
+  df_obs = df_full[!is.na(df_full$y),]     # Observed data
+
+  ## Strategy 1: h(\overline{L}_{i,t})=P(Y_{i,k,t}>0|\overline{L}_{i,t},A_{t}=0)*E(Y_{i,k,t}|\overline{L}_{i,t},A_{t}=0,Y_{i,k,t}>0)
+  mu_pos = function(j, cor_h=T) {   # P(Y_{i,k,t}>0|\overline{L}_{i,t},A_{t}=0)
+    df = df_obs %>% filter(category==j,A==0)
+    df = df %>% mutate(y=if_else(y>0,1,y))
+    if (cor_h ==T) {
+      varnames = c(paste0(c("category","after_lockdown","yhist_pos_"),j),"y","X","yhist_mean")
+    } else {
+      varnames = c(paste0(c("category"),j),"y","yhist_mean")
+    }
+    df = df[,match(varnames,names(df))]
+    if (cor_h==T) {
+      f <- as.formula(paste("y ~ ",paste(paste0(c("category","yhist_pos_"),j),collapse="+"),"+s(",
+                            paste(varnames[!varnames %in% c(paste0(c("category","Ax","yhist_pos_"),j),"y")], collapse = " , "),")-1"))
+    } else {
+      f <- as.formula(paste("y ~ ",paste(paste0(c("category"),j),collapse="+"),"+s(",
+                            paste(varnames[!varnames %in% c(paste0(c("category","Ax","yhist_pos_"),j),"y")], collapse = " , "),",k=5)-1"))
+    }
+    return(gam(f, data=df, family=binomial))
+  }
+  mu_pos_cg = suppressWarnings(lapply(1:K, function(x) mu_pos(x, cor_h=T)))  # Correct h model
+  mu_pos_wg = suppressWarnings(lapply(1:K, function(x) mu_pos(x, cor_h=F)))  # Wrong h model
+  
+  mu_out = function(j, cor_h=T) { # E(Y_{i,k,t}|\overline{L}_{i,t},A_{t}=0,Y_{i,k,t}>0)
+    df = df_obs %>% filter(category==j,A==0, y>0)
+    if (cor_h ==T) {
+      varnames = c(paste0(c("category","after_lockdown","yhist_pos_"),j),"y","X","yhist_mean")
+    } else {
+      varnames = c(paste0(c("category"),j),"y","yhist_mean")
+    }
+    df = df[,match(varnames,names(df))]
+    if (cor_h==T) {
+      f <- as.formula(paste("y ~ ",paste(paste0(c("category","yhist_pos_"),j),collapse="+"),"+s(",
+                            paste(varnames[!varnames %in% c(paste0(c("category","Ax","yhist_pos_"),j),"y")], collapse = " , "),")-1"))
+    } else {
+      f <- as.formula(paste("y ~ ",paste(paste0(c("category"),j),collapse="+"),"+s(",
+                            paste(varnames[!varnames %in% c(paste0(c("category","Ax","yhist_pos_"),j),"y")], collapse = " , "),",k=5)-1"))
+    }
+    return(gam(f, data=df, family=gaussian(link="log")))
+  }
+  mu_out_cg = try(lapply(1:K, function(x) mu_out(x, cor_h=T))); com=0  # Correct h model
+                                                                       # But, this model will be bad if there are not sufficient number of cases Y>0
+                                                                       # > Therefore, there exists insurance below
+  mu_out_wg = suppressWarnings(lapply(1:K, function(x) mu_out(x, cor_h=F)))  # Wrong h model
+  
+  if (inherits(mu_out_cg, "try-error")) { # If there are not sufficient number of cases Y>0, this is an insurance
+    mu = function(j, cor_h=T) {
+      df = df_obs %>% filter(category==j,A==0)
+      if (cor_h ==T) {
+        varnames = c(paste0(c("category","after_lockdown","yhist_pos_"),j),"y","X","yhist_mean")
+      } else {
+        varnames = c(paste0(c("category"),j),"y","yhist_mean")
+      }
+      df = df[,match(varnames,names(df))]
+      if (cor_h==T) {
+        f <- as.formula(paste("y ~ ",paste(paste0(c("category","yhist_pos_"),j),collapse="+"),"+s(",
+                              paste(varnames[!varnames %in% c(paste0(c("category","Ax","yhist_pos_"),j),"y")], collapse = " , "),")-1"))
+      } else {
+        f <- as.formula(paste("y ~ ",paste(paste0(c("category"),j),collapse="+"),"+s(",
+                              paste(varnames[!varnames %in% c(paste0(c("category","Ax","yhist_pos_"),j),"y")], collapse = " , "),",k=5)-1"))
+      }
+      return(gam(f, data=df, family=gaussian(link="log")))
+    }
+    mu_com_cg = suppressWarnings(lapply(1:K, function(x) mu(x, cor_h=T)))
+    mu_com_wg = suppressWarnings(lapply(1:K, function(x) mu(x, cor_h=F)))
+    com = 1
+  }
+  
+
+  ### Mean outcome model prediction
+  df_full$mu_cg <-df_full$mu_wg <- 0 # Initial values
+  categorized_pred = function(j, com) {
+    # target dataframe(where category==j)
+    df_target = df_full %>% filter(category==j)
+    df_target = df_target %>% mutate(Ax1=0, Ax2=0, Ax3=0, Ax4=0)
+    if (com == 0) {
+      muout_cg = predict(mu_out_cg[[j]], df_target, type="response")
+      muout_wg = predict(mu_out_wg[[j]], df_target, type="response")
+      mupos_cg = predict(mu_pos_cg[[j]], df_target, type="response")
+      mupos_wg = predict(mu_pos_wg[[j]], df_target, type="response")
+      mu_cg = muout_cg * mupos_cg
+      mu_wg = muout_wg * mupos_wg
+      
+    } else {
+      mu_cg = predict(mu_com_cg[[j]], df_target, type="response")
+      mu_wg = predict(mu_com_wg[[j]], df_target, type="response")
+      
+    }
+    
+    
+    # Analyzing indicator of observation in detail for prediction efficiency
+    count_cal = function(x) {
+      cand = rle(x)
+      ls = c()
+      for ( l in 1:length(cand$lengths)) {
+        if ((cand$lengths[l]>1)&(cand$values[l]==1)) {  
+          # for consecutive observations in a single subject (ex: 0 0 1 1 0 0 1 0)
+          ls=c(ls, rep(c(1,0),(cand$lengths[l]-1)),1)
+        } else {
+          # no consecutive observation (ex: 0 0 1 0 0 1 0 0 )
+          ls=c(ls,cand$lengths[l])
+        }
+      }
+      
+      # combining the result
+      if (cand$values[1]==1) {
+        # when this subject has the first visiting time (ex: 1 0 0 1 0 0 0)
+        without1 = ls[-seq(1,length(ls),2)]
+        res = without1+1
+        res[length(res)] = res[length(res)]-1
+        res = c(1, res)
+      } else {
+        # if not (ex: 0 1 0 0 0 1 0 0)
+        without1 = ls[-seq(2,length(ls),2)]
+        res = without1+1
+        res[length(res)] = res[length(res)]-1
+      }
+      
+      return(res)
+    }
+    
+    return(list(
+      mu_cg = mu_cg,
+      mu_wg = mu_wg
+    ))
+  }
+  for (j in 1:K) {
+    # applying efficient prediction for every categories
+    hats = categorized_pred(j, com)
+    df_full$mu_cg[df_full$category==j] = hats$mu_cg
+    df_full$mu_wg[df_full$category==j] = hats$mu_wg
+  }
+  
+  
+  ### Casual parameter estimation
+  niiw_psi = matrix(runif(10, -1, 1), ncol=1)   # Initial causal parameters
+  
+  ## Setup data
+  # 1. Full dataset
+  X = cbind(df_full$X, df_full$yhist_mean, 
+            df_full$category1, df_full$after_lockdown1,
+            df_full$category2, df_full$after_lockdown2,
+            df_full$category3, df_full$after_lockdown3,
+            df_full$category4, df_full$after_lockdown4)
+  ind_W_gam = Diagonal(x=(df_full$A-df_full$pihat_gam))
+  ind_W_cs = Diagonal(x=(df_full$A-df_full$pihat_cs))
+  ind_W_wcs = Diagonal(x=(df_full$A-df_full$pihat_wcs))
+  ind_W_wgam = Diagonal(x=(df_full$A-df_full$pihat_wgam))
+  ind_W_noprop = Diagonal(x = df_full$A)
+  ind_iiw = df_full$ind_iiw
+  ind_iiww = df_full$ind_iiww
+  iw = df_full%>% mutate(iw = ind_iw * lambdat) %>% dplyr::select(iw)
+  iww = df_full%>% mutate(iww = ind_iww * lambdat_w) %>% dplyr::select(iww)
+  df_full = df_full %>% mutate(outcome1 = if_else(is.na(y),0,y))
+  
+  # 1. Observed dataset
+  df_obs = df_full[!is.na(df_full$y),]
+  X_obs = cbind(df_obs$X, df_obs$yhist_mean,
+                df_obs$category1, df_obs$after_lockdown1,
+                df_obs$category2, df_obs$after_lockdown2,
+                df_obs$category3, df_obs$after_lockdown3,
+                df_obs$category4, df_obs$after_lockdown4)
+  
+  ind_W_gam_obs = Diagonal(x=(df_obs$A-df_obs$pihat_gam))
+  ind_W_cs_obs = Diagonal(x=(df_obs$A-df_obs$pihat_cs))
+  ind_W_wcs_obs = Diagonal(x=(df_obs$A-df_obs$pihat_wcs))
+  ind_W_wgam_obs = Diagonal(x=(df_obs$A-df_obs$pihat_wgam))
+  ind_W_noprop_obs = Diagonal(x = df_obs$A)
+  ind_iiw_obs = df_obs$ind_iiw
+  ind_iiww_obs = df_obs$ind_iiww
+  
+  ## Naive score function
+  score_func_naive = function(init_psi, X, ind_W, cor_iiw=T, cor_h=T, no_h=F, gam=F) {
+    if (cor_iiw==T) {
+      temp_ind_iiw = ind_iiw_obs
+    } else {
+      temp_ind_iiw = ind_iiww_obs
+    }
+    
+    if (cor_h==T) {
+      h = df_obs$mu_cg
+    } else {
+      h = df_obs$mu_wg
+    }
+    
+    if (no_h == T) {h=0}
+    H = df_obs$y*exp(-X %*% matrix(init_psi, ncol=1) * df_obs$A)*temp_ind_iiw
+    output = as.matrix( t(X) %*% ind_W %*% (H-as.matrix(h*temp_ind_iiw, ncol=1)) )
+    output[is.nan(output)] = max(output[!is.nan(output)])
+    return(output)
+  }
+  
+  ## Naive score function
+  asym_cov_cal = function(coef, ind_W, cor_h=T, cor_iiw=T, no_h=F, gam=F) {
+    if (cor_iiw == T ) {
+      temp_iiw_obs = ind_iiw_obs
+    } else {
+      temp_iiw_obs = ind_iiww_obs
+    }
+    HAX = df_obs$y*exp(-X_obs %*% matrix(coef, ncol=1) * df_obs$A)*temp_iiw_obs*df_obs$A*(-1)
+    tdf_obs = cbind(df_obs, HAX)
+    H = tdf_obs %>% mutate(h1 = X*HAX, h2= yhist_mean*HAX,
+                           hc1 = category1*HAX, ha1 = after_lockdown1*HAX,
+                           hc2 = category2*HAX, ha2 = after_lockdown2*HAX,
+                           hc3 = category3*HAX, ha3 = after_lockdown3*HAX,
+                           hc4 = category4*HAX, ha4 = after_lockdown4*HAX
+    ) %>% dplyr::select(h1, h2, hc1, ha1, hc2, ha2, hc3, ha3, hc4, ha4)
+    H = as.matrix(H)
+    obs_N = length(include_idx)
+    
+    Ahat_inv = solve(-as.matrix( t(X_obs) %*% ind_W %*% (H) )/(obs_N*Tp))
+    
+    sum_ua = 0
+    
+    for ( k in sort(unique(df_obs$obs_t)) ) { # for each subject i 
+      # total data (including all the other's visits)
+      indx = which(df_obs$obs_t == k)
+      
+      ttX = X_obs[indx,]   # Z_{i}(t)
+      tW = ind_W[indx, indx]  # dLambda(t)
+      H = tdf_obs$y[indx]*exp(-ttX %*% matrix(coef, ncol=1) * tdf_obs$A[indx])*temp_iiw_obs[indx]
+      if (cor_h==T) {
+        hhat_lbar_all = tdf_obs$mu_cg[indx]*temp_iiw_obs[indx]
+      } else {
+        hhat_lbar_all = tdf_obs$mu_wg[indx]*temp_iiw_obs[indx]
+      }
+      if (no_h==T) {hhat_lbar_all = rep(0, length(hhat_lbar_all))}
+      ua =  Ahat_inv %*% t(ttX) %*% tW %*% (H-as.matrix(hhat_lbar_all, ncol=1))/obs_N
+      sum_ua = sum_ua + tcrossprod(ua)/Tp
+    }
+    
+    # Asymptotic covariance of beta_AIPWE  
+    hat_asym_cov_aipwe = sum_ua/Tp
+    
+    # Wald type asymptotic 95% confidence interval of beta_AIPWE
+    z_prod_se_aipwe = qnorm(0.975)*sqrt(diag(hat_asym_cov_aipwe))
+    lbd_aipwe = coef-z_prod_se_aipwe
+    ubd_aipwe = coef+z_prod_se_aipwe
+    
+    return(list(hat_cov = diag(hat_asym_cov_aipwe), lbd = lbd_aipwe, ubd = ubd_aipwe))
+  }
+  
+  
+  ## [ Nothing (No propensity, No h) ]
+  # 1. No prop + no h + correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  mu_naive = function(cor_iiw=T, max_iter=10) {
+    df = df_obs
+    if (cor_iiw==T) {temp_iiw = df$ind_iiw} else {temp_iiw = df$ind_iiww}
+    varnames = c("X","yhist_mean",paste0(c("category","after_lockdown"),rep(1:K, each=2)),"y","A")
+    df = df[,match(varnames,names(df))]
+    f <- as.formula(paste("y ~ ",
+                          paste(varnames[!varnames %in% c("y","A")],collapse="+"),"+A:(",
+                          paste(varnames[!varnames %in% c("y","A")],collapse="+"),")-1"))
+    
+    glm_res = tryCatch(glm(f, data=df, family=gaussian(link="log"), start = c(runif(20,-1,1)), weights=temp_iiw))
+    if (sum(abs(glm_res$coefficients)>5)>0) {
+      it = 1
+      while ((it<=max_iter)&(sum(abs(glm_res$coefficients)>5)>0)) {
+        it = it + 1
+        glm_res = glm(f, data=df, family=gaussian(link="log"), start = c(runif(20,-1,1)), weights=temp_iiw)
+      }
+      if (it>max_iter) {
+        glm_res = "FAIL"
+      }
+    }
+    
+    return(glm_res)
+  }
+  init_psi_nothing = suppressWarnings(mu_naive())
+  if (exists("init_psi_nothing")==F) {
+    nothing_sum_coef <- nothing_sum_coef_niiw <- niiw_psi; 
+    nothing_sum_se <- nothing_sum_se_niiw <- rep(0, length(niiw_psi))
+  } else {
+    if (is.character(init_psi_nothing)) {
+      nothing_sum_coef <- nothing_sum_coef_niiw <- niiw_psi; 
+      nothing_sum_se <- nothing_sum_se_niiw <- rep(0, length(niiw_psi))
+    } else {
+      nothing_sum = summary(init_psi_nothing)$coefficients[11:20,1:2]
+      nothing_sum_coef <-nothing_sum_coef_niiw <- as.vector(nothing_sum[,1])
+      nothing_sum_se<-nothing_sum_se_niiw <- as.vector(nothing_sum[,2])
+    }
+  }
+  
+  
+  # 2. No prop + no h + Wrong IIW
+  niiw_psi = as.matrix(nothing_sum_coef)
+  # [ SING_h (No propensity, Yes h) ]
+  ## Nonparametric (parametric model for h is not available)
+  ### Correct h + No propensity + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_noprop_obs, cor_h=T, gam=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_noprop_obs, cor_h=T, gam=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_npi = as.vector(init_psi)
+  
+  ### Correct h + No propensity + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_noprop_obs, 
+                                                    cor_iiw=F, cor_h=T, gam=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_noprop_obs,  
+                                                      cor_iiw=F, cor_h=T, gam=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_npi_niiw = as.vector(init_psi)
+  
+  ### Wrong h + No propensity + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_noprop_obs, cor_h=F, gam=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_noprop_obs, cor_h=F, gam=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_npi = as.vector(init_psi)
+  
+  ### Wrong h + No propensity + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_noprop_obs, 
+                                                    cor_iiw=F, cor_h=F, gam=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_noprop_obs,  
+                                                      cor_iiw=F, cor_h=F, gam=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_npi_niiw = as.vector(init_psi)
+  
+  # [ SING_p (Yes propensity, No h) ]
+  ## 1. Parametric propensity
+  ### 1-1) Correct propensity + NO h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, no_h=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, no_h=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_nh_cppi = as.vector(init_psi)
+  
+  ### 1-2) Correct propensity + NO h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, 
+                                                    cor_iiw=F, no_h=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs,  
+                                                      cor_iiw=F, no_h=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_nh_cppi_niiw = as.vector(init_psi)
+  
+  ### 1-3) Wrong propensity + NO h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, no_h=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, no_h=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_nh_wppi = as.vector(init_psi)
+  
+  ### 1-4) Wrong propensity + NO h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, 
+                                                    cor_iiw=F, no_h=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs,  
+                                                      cor_iiw=F, no_h=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_nh_wppi_niiw = as.vector(init_psi)
+  
+  ## 2. Nonparametric propensity
+  ### 2-1) Correct propensity + NO h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, no_h=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, no_h=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_nh_cgpi = as.vector(init_psi)
+  
+  ### 2-2) Correct propensity + NO h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, 
+                                                    cor_iiw=F, no_h=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs,  
+                                                      cor_iiw=F, no_h=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_nh_cgpi_niiw = as.vector(init_psi)
+  
+  ### 2-3) Wrong propensity + NO h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, no_h=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, no_h=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_nh_wgpi = as.vector(init_psi)
+  
+  ### 2-4) Wrong propensity + NO h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, 
+                                                    cor_iiw=F, no_h=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs,  
+                                                      cor_iiw=F, no_h=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_nh_wgpi_niiw = as.vector(init_psi)
+  
+  # [ Doubly robust estimator ]
+  
+  ## 1. Parametric propensity + Nonparametric h
+  ### 1-1). Correct propensity + Correct h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, cor_h=T, gam=T, cor_iiw=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, cor_h=T, gam=T, cor_iiw=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_cppi = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_cgh_cppi, ind_W = ind_W_cs_obs, cor_iiw=T, cor_h=T, gam=T)
+  init_psi_cgh_cppi_hat_cov = as.vector(ss$hat_cov)
+  
+  
+  ### 1-2). Correct propensity + Correct h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, cor_h=T, gam=T, cor_iiw=F), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, cor_h=T, gam=T, cor_iiw=F), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_cppi_niiw = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_cgh_cppi_niiw, ind_W = ind_W_cs_obs, cor_h=T, gam=T, cor_iiw=F)
+  init_psi_cgh_cppi_niiw_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 1-3). Wrong propensity + Correct h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, cor_h=T, gam=T, cor_iiw=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, cor_h=T, gam=T, cor_iiw=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_wppi = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_cgh_wppi, ind_W = ind_W_wcs_obs, cor_iiw=T, cor_h=T, gam=T)
+  init_psi_cgh_wppi_hat_cov = as.vector(ss$hat_cov)
+  
+  
+  ### 1-4). Wrong propensity + Correct h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, cor_h=T, gam=T, cor_iiw=F), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, cor_h=T, gam=T, cor_iiw=F), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_wppi_niiw = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_cgh_wppi_niiw, ind_W = ind_W_wcs_obs, cor_h=T, gam=T, cor_iiw=F)
+  init_psi_cgh_wppi_niiw_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 1-5). Correct propensity + Wrong h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, cor_h=F, gam=T, cor_iiw=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, cor_h=F, gam=T, cor_iiw=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_cppi = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_wgh_cppi, ind_W = ind_W_cs_obs, cor_iiw=T, cor_h=F, gam=T)
+  init_psi_wgh_cppi_hat_cov = as.vector(ss$hat_cov)
+  
+  
+  ### 1-6). Correct propensity + Wrong h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, cor_h=F, gam=T, cor_iiw=F), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_cs_obs, cor_h=F, gam=T, cor_iiw=F), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_cppi_niiw = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_wgh_cppi_niiw, ind_W = ind_W_cs_obs, cor_h=F, gam=T, cor_iiw=F)
+  init_psi_wgh_cppi_niiw_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 1-7). Wrong propensity + Correct h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, cor_h=F, gam=T, cor_iiw=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, cor_h=F, gam=T, cor_iiw=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_wppi = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_wgh_wppi, ind_W = ind_W_wcs_obs, cor_iiw=T, cor_h=F, gam=T)
+  init_psi_wgh_wppi_hat_cov = as.vector(ss$hat_cov)
+  
+  
+  ### 1-8). Wrong propensity + Correct h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, cor_h=F, gam=T, cor_iiw=F), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wcs_obs, cor_h=F, gam=T, cor_iiw=F), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_wppi_niiw = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_wgh_wppi_niiw, ind_W = ind_W_wcs_obs, cor_h=F, gam=T, cor_iiw=F)
+  init_psi_wgh_wppi_niiw_hat_cov = as.vector(ss$hat_cov)
+  
+  
+  ## 2. Nonparametric propensity + Nonparametric h
+  ### 2-1). Correct propensity + Correct h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, cor_h=T, gam=T, cor_iiw=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, cor_h=T, gam=T, cor_iiw=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_cgpi = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_cgh_cgpi, ind_W = ind_W_gam_obs, cor_iiw=T, cor_h=T, gam=T)
+  init_psi_cgh_cgpi_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 2-2). Correct propensity + Correct h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, cor_h=T, gam=T, cor_iiw=F), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, cor_h=T, gam=T, cor_iiw=F), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_cgpi_niiw = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_cgh_cgpi_niiw, ind_W = ind_W_gam_obs, cor_h=T, gam=T, cor_iiw=F)
+  init_psi_cgh_cgpi_niiw_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 2-3). Correct propensity + Wrong h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, cor_h=F, gam=T, cor_iiw=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, cor_h=F, gam=T, cor_iiw=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_cgpi = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_wgh_cgpi, ind_W = ind_W_gam_obs, cor_iiw=T, cor_h=F, gam=T)
+  init_psi_wgh_cgpi_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 2-4). Correct propensity + Wrong h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, cor_h=F, gam=T, cor_iiw=F), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_gam_obs, cor_h=F, gam=T, cor_iiw=F), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_cgpi_niiw = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_wgh_cgpi_niiw, ind_W = ind_W_gam_obs, cor_h=F, gam=T, cor_iiw=F)
+  init_psi_wgh_cgpi_niiw_hat_cov = as.vector(ss$hat_cov)
+  
+  
+  ### 2-5). Wrong propensity + Correct h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, cor_h=T, gam=T, cor_iiw=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, cor_h=T, gam=T, cor_iiw=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_wgpi = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_cgh_wgpi, ind_W = ind_W_wgam_obs, cor_iiw=T, cor_h=T, gam=T)
+  init_psi_cgh_wgpi_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 2-6). Wrong propensity + Correct h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, cor_h=T, gam=T, cor_iiw=F), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, cor_h=T, gam=T, cor_iiw=F), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_cgh_wgpi_niiw = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_cgh_wgpi_niiw, ind_W = ind_W_wgam_obs, cor_h=T, gam=T, cor_iiw=F)
+  init_psi_cgh_wgpi_niiw_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 2-7). Wrong propensity + Wrong h + Correct IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, cor_h=F, gam=T, cor_iiw=T), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, cor_h=F, gam=T, cor_iiw=T), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_wgpi = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_wgh_wgpi, ind_W = ind_W_wgam_obs, cor_iiw=T, cor_h=F, gam=T)
+  init_psi_wgh_wgpi_hat_cov = as.vector(ss$hat_cov)
+  
+  ### 2-8). Wrong propensity + Wrong h + Wrong IIW
+  init_psi_0 = niiw_psi   # Initial psi for the optimizer
+  prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, cor_h=F, gam=T, cor_iiw=F), start=init_psi_0)
+  init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+  iteration = 1; max=100
+  while ((sum((init_psi_0-init_psi)^2) > 1e-4)&(iteration<max)) {
+    init_psi_0 = init_psi
+    prop_est = multiroot(function(x) score_func_naive(x, X = X_obs, ind_W = ind_W_wgam_obs, cor_h=F, gam=T, cor_iiw=F), start=init_psi_0)
+    init_psi = matrix(prop_est$root, nrow=nrow(init_psi_0), ncol=1)
+    iteration = iteration +1
+  }
+  init_psi_wgh_wgpi_niiw = as.vector(init_psi)
+  ss = asym_cov_cal(coef=init_psi_wgh_wgpi_niiw, ind_W = ind_W_wgam_obs, cor_h=F, gam=T, cor_iiw=F)
+  init_psi_wgh_wgpi_niiw_hat_cov = as.vector(ss$hat_cov)
+  
+  
+  # Final result
+  est_result = list(nothing = nothing_sum_coef,
+                    nothing_hat_cov = nothing_sum_se, 
+                    nothing_niiw = nothing_sum_coef_niiw,
+                    nothing_niiw_hat_cov = nothing_sum_se_niiw, 
+                    
+                    cgh_npi = init_psi_cgh_npi,
+                    cgh_npi_niiw = init_psi_cgh_npi_niiw,
+                    wgh_npi = init_psi_wgh_npi,
+                    wgh_npi_niiw = init_psi_wgh_npi_niiw,
+                    
+                    nh_cppi = init_psi_nh_cppi,
+                    nh_cppi_niiw = init_psi_nh_cppi_niiw,
+                    nh_wppi = init_psi_nh_wppi,
+                    nh_wppi_niiw = init_psi_nh_wppi_niiw,
+                    nh_cgpi = init_psi_nh_cgpi,
+                    nh_cgpi_niiw = init_psi_nh_cgpi_niiw,
+                    nh_wgpi = init_psi_nh_wgpi,
+                    nh_wgpi_niiw = init_psi_nh_wgpi_niiw,
+                    
+                    cgh_cppi = init_psi_cgh_cppi,
+                    cgh_cppi_hat_cov = init_psi_cgh_cppi_hat_cov,
+                    cgh_cppi_niiw = init_psi_cgh_cppi_niiw,
+                    cgh_cppi_niiw_hat_cov = init_psi_cgh_cppi_niiw_hat_cov,
+                    cgh_wppi = init_psi_cgh_wppi,
+                    cgh_wppi_hat_cov = init_psi_cgh_wppi_hat_cov,
+                    cgh_wppi_niiw = init_psi_cgh_wppi_niiw,
+                    cgh_wppi_niiw_hat_cov = init_psi_cgh_wppi_niiw_hat_cov,
+                    
+                    wgh_cppi = init_psi_wgh_cppi,
+                    wgh_cppi_hat_cov = init_psi_wgh_cppi_hat_cov,
+                    wgh_cppi_niiw = init_psi_wgh_cppi_niiw,
+                    wgh_cppi_niiw_hat_cov = init_psi_wgh_cppi_niiw_hat_cov,
+                    wgh_wppi = init_psi_wgh_wppi,
+                    wgh_wppi_hat_cov = init_psi_wgh_wppi_hat_cov,
+                    wgh_wppi_niiw = init_psi_wgh_wppi_niiw,
+                    wgh_wppi_niiw_hat_cov = init_psi_wgh_wppi_niiw_hat_cov,
+                    
+                    cgh_cgpi = init_psi_cgh_cgpi,
+                    cgh_cgpi_hat_cov = init_psi_cgh_cgpi_hat_cov,
+                    cgh_cgpi_niiw = init_psi_cgh_cgpi_niiw,
+                    cgh_cgpi_niiw_hat_cov = init_psi_cgh_cgpi_niiw_hat_cov,
+                    wgh_cgpi = init_psi_wgh_cgpi,
+                    wgh_cgpi_hat_cov = init_psi_wgh_cgpi_hat_cov,
+                    wgh_cgpi_niiw = init_psi_wgh_cgpi_niiw,
+                    wgh_cgpi_niiw_hat_cov = init_psi_wgh_cgpi_niiw_hat_cov,
+                    
+                    cgh_wgpi = init_psi_cgh_wgpi,
+                    cgh_wgpi_hat_cov = init_psi_cgh_wgpi_hat_cov,
+                    cgh_wgpi_niiw = init_psi_cgh_wgpi_niiw,
+                    cgh_wgpi_niiw_hat_cov = init_psi_cgh_wgpi_niiw_hat_cov,
+                    wgh_wgpi = init_psi_wgh_wgpi,
+                    wgh_wgpi_hat_cov = init_psi_wgh_wgpi_hat_cov,
+                    wgh_wgpi_niiw = init_psi_wgh_wgpi_niiw,
+                    wgh_wgpi_niiw_hat_cov = init_psi_wgh_wgpi_niiw_hat_cov
+                    
+                    
+  )
+  
+  
+  return(est_result)
+}
+
+target_data = paste0(sim_model,"_N",N,"_Iter",num,"_Tp",Tp,"_SimData.RData")
+save(result, file=paste0(target_data))
+result$sim_data = NA   # For memory efficiency
+
+
+################################################################################
+############################# Parallel Computing ###############################
+################################################################################
+
+### Running the psi estimating code in the cluster
+no_cores <- detectCores(logical=F)-1
+cl <- makeCluster(no_cores)
+registerDoParallel(cl)
+
+### Correct intensity
+res = list()
+res <- foreach(i=1:num, 
+               .packages = c("MASS","survival","purrr",
+                             "dplyr","mgcv",
+                             "Matrix","rootSolve"),.errorhandling = 'pass') %dopar% 
+  psi_estimation(i)
+
+### Record the estimates
+# true psi
+result$para = c(psi_1,psi_2,rep(rowSums(psi[,3:4]), each=2))
+result$nui = c(gamma[c(4:6)],pi0[-4])
+
+
+result$nothing = simplify2array(lapply(res, function(x) x$nothing))
+result$nothing_hat_cov = simplify2array(lapply(res, function(x) x$nothing_hat_cov ))
+result$nothing_niiw = simplify2array(lapply(res, function(x) x$nothing_niiw))
+result$nothing_niiw_hat_cov = simplify2array(lapply(res, function(x) x$nothing_niiw_hat_cov ))
+
+result$cgh_npi = simplify2array(lapply(res, function(x) x$cgh_npi))
+result$cgh_npi_niiw = simplify2array(lapply(res, function(x) x$cgh_npi_niiw))
+result$wgh_npi = simplify2array(lapply(res, function(x) x$wgh_npi))
+result$wgh_npi_niiw = simplify2array(lapply(res, function(x) x$wgh_npi_niiw))
+
+result$nh_cppi = simplify2array(lapply(res, function(x) x$nh_cppi))
+result$nh_cppi_niiw = simplify2array(lapply(res, function(x) x$nh_cppi_niiw))
+result$nh_wppi = simplify2array(lapply(res, function(x) x$nh_wppi))
+result$nh_wppi_niiw = simplify2array(lapply(res, function(x) x$nh_wppi_niiw))
+result$nh_cgpi = simplify2array(lapply(res, function(x) x$nh_cgpi))
+result$nh_cgpi_niiw = simplify2array(lapply(res, function(x) x$nh_cgpi_niiw))
+result$nh_wgpi = simplify2array(lapply(res, function(x) x$nh_wgpi))
+result$nh_wgpi_niiw = simplify2array(lapply(res, function(x) x$nh_wgpi_niiw))
+
+result$cgh_cppi = simplify2array(lapply(res, function(x) x$cgh_cppi))
+result$cgh_cppi_hat_cov = simplify2array(lapply(res, function(x) x$cgh_cppi_hat_cov))
+result$cgh_cppi_niiw = simplify2array(lapply(res, function(x) x$cgh_cppi_niiw))
+result$cgh_cppi_niiw_hat_cov = simplify2array(lapply(res, function(x) x$cgh_cppi_niiw_hat_cov))
+result$cgh_wppi = simplify2array(lapply(res, function(x) x$cgh_wppi))
+result$cgh_wppi_hat_cov = simplify2array(lapply(res, function(x) x$cgh_wppi_hat_cov))
+result$cgh_wppi_niiw = simplify2array(lapply(res, function(x) x$cgh_wppi_niiw))
+result$cgh_wppi_niiw_hat_cov = simplify2array(lapply(res, function(x) x$cgh_wppi_niiw_hat_cov))
+
+result$wgh_cppi = simplify2array(lapply(res, function(x) x$wgh_cppi))
+result$wgh_cppi_hat_cov = simplify2array(lapply(res, function(x) x$wgh_cppi_hat_cov))
+result$wgh_cppi_niiw = simplify2array(lapply(res, function(x) x$wgh_cppi_niiw))
+result$wgh_cppi_niiw_hat_cov = simplify2array(lapply(res, function(x) x$wgh_cppi_niiw_hat_cov))
+result$wgh_wppi = simplify2array(lapply(res, function(x) x$wgh_wppi))
+result$wgh_wppi_hat_cov = simplify2array(lapply(res, function(x) x$wgh_wppi_hat_cov))
+result$wgh_wppi_niiw = simplify2array(lapply(res, function(x) x$wgh_wppi_niiw))
+result$wgh_wppi_niiw_hat_cov = simplify2array(lapply(res, function(x) x$wgh_wppi_niiw_hat_cov))
+
+result$cgh_cgpi = simplify2array(lapply(res, function(x) x$cgh_cgpi))
+result$cgh_cgpi_hat_cov = simplify2array(lapply(res, function(x) x$cgh_cgpi_hat_cov))
+result$cgh_cgpi_niiw = simplify2array(lapply(res, function(x) x$cgh_cgpi_niiw))
+result$cgh_cgpi_niiw_hat_cov = simplify2array(lapply(res, function(x) x$cgh_cgpi_niiw_hat_cov))
+result$cgh_wgpi = simplify2array(lapply(res, function(x) x$cgh_wgpi))
+result$cgh_wgpi_hat_cov = simplify2array(lapply(res, function(x) x$cgh_wgpi_hat_cov))
+result$cgh_wgpi_niiw = simplify2array(lapply(res, function(x) x$cgh_wgpi_niiw))
+result$cgh_wgpi_niiw_hat_cov = simplify2array(lapply(res, function(x) x$cgh_wgpi_niiw_hat_cov))
+
+result$wgh_cgpi = simplify2array(lapply(res, function(x) x$wgh_cgpi))
+result$wgh_cgpi_hat_cov = simplify2array(lapply(res, function(x) x$wgh_cgpi_hat_cov))
+result$wgh_cgpi_niiw = simplify2array(lapply(res, function(x) x$wgh_cgpi_niiw))
+result$wgh_cgpi_niiw_hat_cov = simplify2array(lapply(res, function(x) x$wgh_cgpi_niiw_hat_cov))
+result$wgh_wgpi = simplify2array(lapply(res, function(x) x$wgh_wgpi))
+result$wgh_wgpi_hat_cov = simplify2array(lapply(res, function(x) x$wgh_wgpi_hat_cov))
+result$wgh_wgpi_niiw = simplify2array(lapply(res, function(x) x$wgh_wgpi_niiw))
+result$wgh_wgpi_niiw_hat_cov = simplify2array(lapply(res, function(x) x$wgh_wgpi_niiw_hat_cov))
+
+
+################################################################################
+########################### Save the Final Result ##############################
+################################################################################
+
+### For auto save after the simulation
+target_data = paste0(sim_model,"_N",N,"_Iter",num,"_Tp",Tp,"_Result.RData")
+save(result, file=target_data)
+
+stopImplicitCluster()
+stopCluster(cl)
