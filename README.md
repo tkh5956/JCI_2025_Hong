@@ -18,5 +18,5 @@ Taekwon Hong
 ## Reference
 If you use this code, please cite the following article:  
 
-Hong, T., Lu, W., Yang, S., & Ghosh, P. (2025). *Multivariate Zero-Inflated Causal Model for Regional Mobility Restriction Effects on Consumer Spending.* Journal of Causal Inference (Just Accepted).  
-arXiv: https://arxiv.org/abs/2510.03422
+Hong, T., Lu, W., Yang, S. & Ghosh, P. (2025). Multivariate zero-inflated causal model for regional mobility restriction effects on consumer spending. Journal of Causal Inference, 13(1), 20240017. https://doi.org/10.1515/jci-2024-0017
+                    
